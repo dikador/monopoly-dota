@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Монополия: Dota 2</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- Экран входа -->
+  <div id="lobby-screen" class="screen">
+    <div class="lobby-card">
+      <div class="logo">⚔️ <span>МОНОПОЛИЯ</span><small>Dota 2</small></div>
+      <p class="tagline">Собери лучший пик героев, захвати башни и разори соперников.</p>
+
+      <label>Ваше имя</label>
+      <input id="name-input" maxlength="16" placeholder="Например: Илон" />
+
+      <div class="lobby-actions">
+        <button id="create-btn" class="btn btn-primary">Создать игру</button>
+        <div class="join-row">
+          <input id="code-input" maxlength="4" placeholder="КОД" />
+          <button id="join-btn" class="btn">Войти</button>
+        </div>
+      </div>
+      <div id="lobby-error" class="error"></div>
+    </div>
+  </div>
+
+  <!-- Экран ожидания -->
+  <div id="waiting-screen" class="screen hidden">
+    <div class="lobby-card">
+      <div class="logo small">⚔️ МОНОПОЛИЯ · Dota 2</div>
+      <p class="tagline">Код комнаты — дайте его друзьям:</p>
+      <div id="room-code" class="room-code">----</div>
+      <p class="hint">Ссылка для друзей: <span id="share-link"></span></p>
+      <div id="waiting-players" class="waiting-players"></div>
+      <div class="picker-label">Выберите героя:</div>
+      <div id="token-picker" class="token-picker"></div>
+      <button id="start-btn" class="btn btn-primary hidden">Начать игру</button>
+      <p id="waiting-hint" class="hint">Ждём, пока хост начнёт игру…</p>
+      <button id="leave-waiting-btn" class="btn">🚪 Выйти из комнаты</button>
+    </div>
+  </div>
+
+  <!-- Игровой экран -->
+  <div id="game-screen" class="screen hidden">
+    <div class="board-wrap">
+      <div id="board" class="board"></div>
+    </div>
+    <aside class="sidebar">
+      <div class="panel" id="players-panel"></div>
+      <div class="panel" id="action-panel"></div>
+      <div class="panel log-panel">
+        <h3>Журнал</h3>
+        <div id="log" class="log"></div>
+        <div class="chat-row">
+          <input id="chat-input" placeholder="Сообщение…" maxlength="200" />
+          <button id="chat-btn" class="btn btn-sm">➤</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- Контейнер уведомлений (как commend в Dota 2) -->
+  <div id="toasts" class="toasts"></div>
+
+  <!-- Модальное окно карточки клетки -->
+  <div id="tile-modal" class="modal hidden">
+    <div class="modal-card" id="tile-modal-content"></div>
+  </div>
+  <!-- Модальное окно сделки -->
+  <div id="trade-modal" class="modal hidden">
+    <div class="modal-card" id="trade-modal-content"></div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="client.js"></script>
+</body>
+</html>

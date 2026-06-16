@@ -1,0 +1,941 @@
+/* global io */
+// transports: только WebSocket — через туннель это заметно быстрее, чем HTTP-поллинг
+const socket = io({ transports: ['websocket'], upgrade: false });
+
+// Постоянный идентификатор игрока и сохранение сессии (переживают перезагрузку)
+let CLIENT_ID = localStorage.getItem('monopoly_cid');
+if (!CLIENT_ID) {
+  CLIENT_ID = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : (Date.now() + '-' + Math.random().toString(36).slice(2));
+  localStorage.setItem('monopoly_cid', CLIENT_ID);
+}
+let MY_NAME = null;
+const SESSION_KEY = 'monopoly_session';
+function saveSession(code, name) { localStorage.setItem(SESSION_KEY, JSON.stringify({ code, name })); }
+function clearSession() { localStorage.removeItem(SESSION_KEY); }
+
+let YOU = null;         // socket id
+let ROOM = null;        // room code
+let STATE = null;       // последнее состояние
+let BOARD = null;       // статическая доска
+let GROUPS = null;
+let TOKEN_HEROES = [];  // герои Dota 2 для выбора фишки
+let lastDice = [0, 0];
+let clientNowAtState = Date.now(); // момент получения последнего состояния (для кулдауна похвал)
+let displayPos = {};               // отображаемая клетка фишки (для пошаговой анимации хода)
+let movingIds = new Set();         // игроки, чьи фишки сейчас шагают
+let hoppingIds = new Set();        // фишки, которым на этом шаге добавить «прыжок»
+
+// ---------- Доска: получаем статические данные с сервера через первый state ----------
+// Чтобы не дублировать board.js, отдадим её через отдельный fetch.
+fetch('/board').then(r => r.json()).then(d => { BOARD = d.BOARD; GROUPS = d.GROUPS; TOKEN_HEROES = d.TOKENS || []; if (STATE) { renderAll(); if (!STATE.started) renderWaiting(); } });
+
+const $ = (id) => document.getElementById(id);
+
+// ---------- Экран входа ----------
+$('create-btn').onclick = () => {
+  const name = $('name-input').value.trim();
+  if (!name) return showLobbyError('Введите имя.');
+  MY_NAME = name;
+  socket.emit('createRoom', { name, clientId: CLIENT_ID }, onJoined);
+};
+$('join-btn').onclick = () => {
+  const name = $('name-input').value.trim();
+  const code = $('code-input').value.trim().toUpperCase();
+  if (!name) return showLobbyError('Введите имя.');
+  if (!code) return showLobbyError('Введите код комнаты.');
+  MY_NAME = name;
+  socket.emit('joinRoom', { name, code, clientId: CLIENT_ID }, onJoined);
+};
+$('code-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('join-btn').click(); });
+$('name-input').addEventListener('keydown', e => { if (e.key === 'Enter') $('create-btn').click(); });
+
+// заход по ссылке-приглашению ?room=XXXX — только вход, без создания игры
+const urlRoom = new URLSearchParams(location.search).get('room');
+if (urlRoom) {
+  const code = urlRoom.toUpperCase();
+  $('code-input').value = code;
+  $('code-input').readOnly = true;
+  $('create-btn').classList.add('hidden');
+  $('join-btn').classList.add('btn-primary');
+  $('join-btn').textContent = 'Войти в игру';
+  const jr = document.querySelector('.join-row');
+  if (jr) jr.classList.add('invited');
+  const tag = document.querySelector('#lobby-screen .tagline');
+  if (tag) tag.textContent = `Вас пригласили в игру (комната ${code}). Введите имя и войдите.`;
+}
+
+function onJoined(res) {
+  if (!res || !res.ok) return showLobbyError(res ? res.error : 'Ошибка соединения.');
+  YOU = res.you; ROOM = res.code;
+  saveSession(res.code, MY_NAME);
+  $('lobby-screen').classList.add('hidden');
+}
+function showLobbyError(msg) { $('lobby-error').textContent = msg; }
+
+// Авто-переподключение после перезагрузки: тихо возвращаемся в свою комнату
+socket.on('connect', () => {
+  YOU = socket.id;
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); } catch (e) {}
+  if (s && s.code && s.name) {
+    MY_NAME = s.name;
+    socket.emit('joinRoom', { name: s.name, code: s.code, clientId: CLIENT_ID }, (res) => {
+      if (res && res.ok) { YOU = res.you; ROOM = res.code; $('lobby-screen').classList.add('hidden'); }
+      else { clearSession(); }
+    });
+  }
+});
+
+// ---------- Ожидание ----------
+$('start-btn').onclick = () => socket.emit('startGame');
+$('leave-waiting-btn').onclick = leaveGame;
+$('room-code').onclick = () => navigator.clipboard && navigator.clipboard.writeText(ROOM);
+
+// ---------- Чат ----------
+$('chat-btn').onclick = sendChat;
+$('chat-input').addEventListener('keydown', e => { if (e.key === 'Enter') sendChat(); });
+function sendChat() {
+  const v = $('chat-input').value.trim();
+  if (v) { socket.emit('chat', v); $('chat-input').value = ''; }
+}
+
+function act(type, extra = {}) { socket.emit('action', { type, ...extra }); }
+
+// Выход из игры: покидаем комнату и очищаем сохранённую сессию
+function leaveGame() {
+  if (!confirm('Выйти из игры? Вы покинете комнату.')) return;
+  socket.emit('leaveRoom');
+  clearSession();
+  setTimeout(() => window.location.reload(), 150);
+}
+
+// тикающий таймер для кулдауна кнопок похвалы
+setInterval(() => { if (STATE && STATE.started) updatePraiseButtons(); }, 500);
+
+// ---------- Приём состояния ----------
+socket.on('state', (s) => {
+  const prevDice = STATE ? STATE.dice : [0, 0];
+  STATE = s;
+  clientNowAtState = Date.now();
+  if (!YOU) YOU = socket.id;
+  routeScreen();
+  if (BOARD) { renderAll(); animateMoves(); }
+  // анимация кубиков
+  if (s.dice && (s.dice[0] !== prevDice[0] || s.dice[1] !== prevDice[1])) animateDice();
+});
+
+// ---------- Уведомления и звук похвалы (как commend в Dota 2) ----------
+socket.on('notify', (n) => {
+  if (n.type === 'praise') {
+    const mine = n.toId === YOU;
+    showToast({
+      icon: '👍',
+      title: mine ? 'Вас похвалили!' : 'Похвала',
+      text: `${n.fromToken} ${n.fromName} → ${n.toToken} ${n.toName}`,
+      sub: `Всего похвал: ${n.praises}`,
+      highlight: mine,
+    });
+    playPraiseSound();
+  }
+});
+
+function showToast({ icon, title, text, sub, highlight }) {
+  const wrap = $('toasts');
+  if (!wrap) return;
+  const el = document.createElement('div');
+  el.className = 'toast' + (highlight ? ' toast-hl' : '');
+  el.innerHTML = `
+    <div class="toast-icon">${icon}</div>
+    <div class="toast-body">
+      <div class="toast-title">${title}</div>
+      <div class="toast-text">${text}</div>
+      ${sub ? `<div class="toast-sub">${sub}</div>` : ''}
+    </div>`;
+  wrap.appendChild(el);
+  // авто-удаление через 4.5с
+  setTimeout(() => {
+    el.classList.add('toast-out');
+    setTimeout(() => el.remove(), 400);
+  }, 4500);
+}
+
+// Синтез «звона награды» через Web Audio (без внешних файлов)
+let audioCtx = null;
+function unlockAudio() {
+  if (!audioCtx) {
+    try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { /* нет аудио */ }
+  }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+// разблокировка по первому взаимодействию (политика автоплея)
+window.addEventListener('pointerdown', unlockAudio, { once: false });
+window.addEventListener('keydown', unlockAudio, { once: false });
+
+function playPraiseSound() {
+  unlockAudio();
+  if (!audioCtx) return;
+  const ctx = audioCtx;
+  const t0 = ctx.currentTime;
+
+  // один «удар» колокола: фундамент + колокольные обертоны, мягкая атака, долгий спад
+  function bell(freq, start, gain, dur) {
+    const partials = [
+      { m: 1.0, g: 1.0 },
+      { m: 2.0, g: 0.5 },
+      { m: 2.76, g: 0.28 },
+      { m: 4.07, g: 0.16 },
+    ];
+    const out = ctx.createGain();
+    out.gain.setValueAtTime(0.0001, start);
+    out.gain.exponentialRampToValueAtTime(gain, start + 0.012);
+    out.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+    out.connect(ctx.destination);
+    partials.forEach(p => {
+      const osc = ctx.createOscillator();
+      const g = ctx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq * p.m;
+      g.gain.value = p.g;
+      osc.connect(g).connect(out);
+      osc.start(start);
+      osc.stop(start + dur + 0.05);
+    });
+  }
+
+  // восходящий «динь-динь» (квинта) — как позитивный звонок-награда
+  bell(1174.66, t0,        0.28, 0.9);  // D6
+  bell(1760.00, t0 + 0.085, 0.30, 1.1); // A6
+
+  // короткая яркая искра сверху
+  const sp = ctx.createOscillator();
+  const sg = ctx.createGain();
+  sp.type = 'sine';
+  sp.frequency.setValueAtTime(2637, t0 + 0.085);   // E7
+  sp.frequency.exponentialRampToValueAtTime(3520, t0 + 0.18); // A7
+  sg.gain.setValueAtTime(0.0001, t0 + 0.085);
+  sg.gain.exponentialRampToValueAtTime(0.10, t0 + 0.11);
+  sg.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.5);
+  sp.connect(sg).connect(ctx.destination);
+  sp.start(t0 + 0.085);
+  sp.stop(t0 + 0.55);
+}
+
+function routeScreen() {
+  if (!STATE.started) {
+    $('waiting-screen').classList.remove('hidden');
+    $('game-screen').classList.add('hidden');
+    renderWaiting();
+  } else {
+    $('waiting-screen').classList.add('hidden');
+    $('game-screen').classList.remove('hidden');
+  }
+}
+
+function renderWaiting() {
+  $('room-code').textContent = STATE.code;
+  $('share-link').textContent = `${location.origin}/?room=${STATE.code}`;
+  const wp = $('waiting-players');
+  wp.innerHTML = '';
+  STATE.players.forEach(p => {
+    const c = document.createElement('div');
+    c.className = 'wp-chip';
+    const av = p.avatar ? `<img class="wp-av" src="${p.avatar}" style="border-color:${p.color}">` : `<span>${p.token}</span>`;
+    c.innerHTML = `${av} ${p.name}${p.id === STATE.hostId ? ' 👑' : ''}`;
+    wp.appendChild(c);
+  });
+  renderTokenPicker();
+  const isHost = STATE.hostId === YOU;
+  $('start-btn').classList.toggle('hidden', !isHost);
+  $('start-btn').disabled = STATE.players.length < 2;
+  $('waiting-hint').textContent = isHost
+    ? (STATE.players.length < 2 ? 'Нужно минимум 2 игрока.' : 'Можно начинать!')
+    : 'Ждём, пока хост начнёт игру…';
+}
+
+function renderTokenPicker() {
+  const picker = $('token-picker');
+  if (!picker) return;
+  picker.innerHTML = '';
+  const me = STATE.players.find(p => p.id === YOU);
+  TOKEN_HEROES.forEach(h => {
+    const takenBy = STATE.players.find(p => p.tokenKey === h.key);
+    const mine = me && me.tokenKey === h.key;
+    const takenByOther = takenBy && (!me || takenBy.id !== me.id);
+    const b = document.createElement('button');
+    b.className = 'token-opt' + (mine ? ' chosen' : '') + (takenByOther ? ' taken' : '');
+    b.title = takenByOther ? `${h.name} — занят (${takenBy.name})` : h.name;
+    b.innerHTML = `<img src="${h.img}" alt="${h.name}" loading="lazy">`;
+    if (!takenByOther) b.onclick = () => socket.emit('chooseToken', { key: h.key });
+    picker.appendChild(b);
+  });
+}
+
+// ---------- Полный рендер игры ----------
+function renderAll() {
+  renderBoard();
+  renderPlayers();
+  renderActions();
+  renderLog();
+  renderTrade();
+}
+
+const GRID = {}; // pos -> {row, col}
+function buildGrid() {
+  // 11x11. pos0 правый-нижний угол.
+  GRID[0] = { r: 11, c: 11 };
+  for (let i = 1; i <= 9; i++) GRID[i] = { r: 11, c: 11 - i };   // нижний ряд
+  GRID[10] = { r: 11, c: 1 };
+  for (let i = 11; i <= 19; i++) GRID[i] = { r: 11 - (i - 10), c: 1 }; // левый столбец
+  GRID[20] = { r: 1, c: 1 };
+  for (let i = 21; i <= 29; i++) GRID[i] = { r: 1, c: (i - 20) + 1 };  // верхний ряд
+  GRID[30] = { r: 1, c: 11 };
+  for (let i = 31; i <= 39; i++) GRID[i] = { r: (i - 30) + 1, c: 11 }; // правый столбец
+}
+buildGrid();
+
+function renderBoard() {
+  const board = $('board');
+  board.innerHTML = '';
+  const starBadges = [];
+
+  BOARD.forEach(t => {
+    const g = GRID[t.pos];
+    const el = document.createElement('div');
+    const isCorner = ['go', 'jail', 'parking', 'gotojail'].includes(t.type);
+    el.className = 'tile' + (isCorner ? ' corner' : '');
+    el.style.gridRow = g.r;
+    el.style.gridColumn = g.c;
+    el.dataset.pos = t.pos;
+
+    const o = STATE.ownership[t.pos];
+    if (o && o.mortgaged) el.classList.add('mortgaged');
+
+    // цветная полоса для улиц / иконка для остальных
+    let inner = '';
+    if (t.type === 'street') {
+      const color = GROUPS[t.group].color;
+      // полоса сверху/сбоку в зависимости от стороны
+      inner += `<div class="colorbar" style="background:${color}"></div>`;
+    }
+    inner += `<div class="body">`;
+    inner += iconMarkup(t);
+    inner += `<div class="tname">${t.name}</div>`;
+    if (t.type === 'tax') {
+      inner += `<div class="tprice">−${t.amount}🪙</div>`;
+    } else if (o && o.mortgaged) {
+      inner += `<div class="tprice mort">залог</div>`;
+    } else if (o) {
+      inner += `<div class="tprice rent">${clientRentDisplay(t, o)}</div>`;
+    } else if (t.price) {
+      inner += `<div class="tprice">${t.price}🪙</div>`;
+    }
+    inner += `</div>`;
+    el.innerHTML = inner;
+
+    // флаг владельца
+    if (o) {
+      const owner = STATE.players.find(p => p.id === o.owner);
+      if (owner) {
+        const flag = document.createElement('div');
+        flag.className = 'owner-flag';
+        flag.style.background = owner.color;
+        el.appendChild(flag);
+      }
+      // уровни застройки — звёздами над клеткой (добавим после цикла)
+      if (t.type === 'street' && o.houses > 0) {
+        starBadges.push({ r: g.r, c: g.c, houses: o.houses });
+      }
+    }
+
+    el.onclick = () => openTileModal(t.pos);
+    board.appendChild(el);
+  });
+
+  // звёзды уровней — поверх, у верхнего края клетки
+  starBadges.forEach(b => {
+    const sb = document.createElement('div');
+    sb.className = 'stars-badge';
+    sb.style.gridRow = b.r;
+    sb.style.gridColumn = b.c;
+    sb.textContent = b.houses === 5 ? '🌟' : '⭐'.repeat(b.houses);
+    sb.title = b.houses === 5 ? 'Отель (макс. уровень)' : `Уровень ${b.houses}`;
+    board.appendChild(sb);
+  });
+
+  // центр
+  const center = document.createElement('div');
+  center.className = 'board-center';
+  const cur = STATE.players[STATE.turnIndex];
+  center.innerHTML = `
+    <div class="center-logo">DOTA 2<small>МОНОПОЛИЯ</small></div>
+    <div class="dice-area">
+      <div class="die" id="die1">${STATE.dice[0] || '?'}</div>
+      <div class="die" id="die2">${STATE.dice[1] || '?'}</div>
+    </div>
+    <div class="turn-banner">${STATE.phase === 'over' ? '🏆 Игра окончена' : `Ход: ${cur ? cur.token + ' ' + cur.name : '—'}`}</div>
+  `;
+  board.appendChild(center);
+
+  // фишки игроков (по отображаемым позициям — для пошаговой анимации)
+  placeTokens();
+}
+
+// Размещение фишек на доске по displayPos (не пересобирая всю доску)
+function placeTokens() {
+  const board = $('board');
+  if (!board) return;
+  board.querySelectorAll('.tokens').forEach(w => w.remove());
+  const curId = STATE.players[STATE.turnIndex] ? STATE.players[STATE.turnIndex].id : null;
+  const byPos = {};
+  STATE.players.forEach(p => {
+    if (p.bankrupt) return;
+    const dp = displayPos[p.id] !== undefined ? displayPos[p.id] : p.pos;
+    (byPos[dp] = byPos[dp] || []).push(p);
+  });
+  Object.keys(byPos).forEach(pos => {
+    const tileEl = board.querySelector(`.tile[data-pos="${pos}"]`);
+    if (!tileEl) return;
+    const wrap = document.createElement('div');
+    wrap.className = 'tokens';
+    byPos[pos].forEach(p => {
+      const tk = document.createElement('span');
+      tk.className = 'player-token';
+      if (hoppingIds.has(p.id)) tk.classList.add('hop');
+      else if (p.id === curId && STATE.phase !== 'over') tk.classList.add('current');
+      tk.style.borderColor = p.color;
+      if (p.avatar) {
+        tk.classList.add('has-img');
+        tk.innerHTML = `<img src="${p.avatar}" alt="" onerror="this.parentNode.classList.remove('has-img');this.parentNode.textContent='${p.token}'">`;
+      } else {
+        tk.style.background = p.color;
+        tk.textContent = p.token;
+      }
+      tk.title = p.name;
+      wrap.appendChild(tk);
+    });
+    tileEl.appendChild(wrap);
+  });
+}
+
+// Запуск анимации перемещения фишек после нового состояния
+function animateMoves() {
+  if (!STATE || !STATE.started) return;
+  STATE.players.forEach(p => {
+    const to = p.pos;
+    if (displayPos[p.id] === undefined) { displayPos[p.id] = to; return; } // первый раз — без анимации
+    if (displayPos[p.id] === to || movingIds.has(p.id)) return;
+    const gap = (to - displayPos[p.id] + 40) % 40;
+    if (gap === 0 || gap > 13) { displayPos[p.id] = to; placeTokens(); return; } // прыжок (карта/тюрьма) — без шагов
+    movingIds.add(p.id);
+    walkStep(p.id);
+  });
+}
+
+function walkStep(pid) {
+  const player = STATE.players.find(x => x.id === pid);
+  if (!player) { movingIds.delete(pid); return; }
+  if (displayPos[pid] === player.pos) { movingIds.delete(pid); placeTokens(); return; }
+  displayPos[pid] = (displayPos[pid] + 1) % 40;
+  hoppingIds.add(pid);
+  placeTokens();
+  setTimeout(() => hoppingIds.delete(pid), 180);
+  setTimeout(() => walkStep(pid), 230);
+}
+
+// Картинка клетки: фото из Dota 2 + запасной эмодзи, если картинка не загрузится
+function iconMarkup(t) {
+  if (t.img) {
+    return `<img class="tphoto" src="${t.img}" alt="${t.name}" loading="lazy" onerror="this.classList.add('img-fail')"><div class="ticon ticon-fb">${t.icon || ''}</div>`;
+  }
+  return `<div class="ticon">${t.icon || ''}</div>`;
+}
+
+// Маленькая миниатюра для списков: картинка Dota 2, если есть, иначе эмодзи
+function propThumb(t) {
+  if (t.img) return `<img class="pi-img" src="${t.img}" alt="" onerror="this.replaceWith(document.createTextNode('${t.icon || ''}'))">`;
+  return `<span class="pi-emoji">${t.icon || ''}</span>`;
+}
+
+function animateDice() {
+  ['die1', 'die2'].forEach(id => {
+    const d = $(id); if (!d) return;
+    d.classList.remove('rolling'); void d.offsetWidth; d.classList.add('rolling');
+  });
+}
+
+function renderPlayers() {
+  const panel = $('players-panel');
+  panel.innerHTML = '<h3>Игроки</h3>';
+  const me = STATE.players.find(p => p.id === YOU);
+  STATE.players.forEach((p, i) => {
+    const card = document.createElement('div');
+    card.className = 'pcard' + (i === STATE.turnIndex && STATE.phase !== 'over' ? ' active' : '') + (p.bankrupt ? ' bankrupt' : '') + (!p.connected ? ' offline' : '');
+    card.innerHTML = `
+      <div class="ptoken">${p.avatar ? `<img class="ptoken-img" src="${p.avatar}" style="border-color:${p.color}" alt="">` : p.token}</div>
+      <div class="pinfo">
+        <div class="pname">
+          <span class="pdot" style="background:${p.color}"></span>
+          <span class="pname-text">${p.name}</span>
+          ${p.id === YOU ? '<span class="youtag">вы</span>' : ''}
+        </div>
+        <div class="pmeta">
+          ${p.inJail ? '<span class="jailtag">🔒</span>' : ''}
+          ${p.getOutCards ? `<span class="aegistag" title="Свитки Aegis">🛡️${p.getOutCards}</span>` : ''}
+          ${p.praises ? `<span class="praisetag" title="Похвалы">👍${p.praises}</span>` : ''}
+        </div>
+      </div>
+      <div class="pmoney">${p.money}🪙</div>
+      ${!p.connected ? '<div class="offline-overlay">Отключён</div>' : ''}
+    `;
+    // кнопка похвалы для других игроков
+    if (me && !me.bankrupt && p.id !== YOU && !p.bankrupt) {
+      const pb = document.createElement('button');
+      pb.className = 'btn praise-btn';
+      pb.dataset.to = p.id;
+      pb.textContent = '👍';
+      pb.title = 'Похвалить игрока';
+      pb.onclick = () => act('praise', { to: p.id });
+      card.appendChild(pb);
+    }
+    panel.appendChild(card);
+  });
+  const leave = document.createElement('button');
+  leave.className = 'btn leave-btn';
+  leave.textContent = '🚪 Выйти из игры';
+  leave.onclick = leaveGame;
+  panel.appendChild(leave);
+  updatePraiseButtons();
+}
+
+// Обновление состояния кнопок похвалы (кулдаун 20 сек)
+function updatePraiseButtons() {
+  if (!STATE) return;
+  const me = STATE.players.find(p => p.id === YOU);
+  const cooldown = STATE.praiseCooldown || 20000;
+  // компенсация расхождения часов клиента и сервера
+  const offset = (STATE.now || Date.now()) - clientNowAtState;
+  const elapsed = (Date.now() + offset) - (me ? me.lastPraiseAt : 0);
+  const remaining = Math.ceil((cooldown - elapsed) / 1000);
+  document.querySelectorAll('.praise-btn').forEach(btn => {
+    if (!me || me.lastPraiseAt === 0 || remaining <= 0) {
+      btn.disabled = false;
+      btn.textContent = '👍';
+      btn.classList.remove('cooling');
+    } else {
+      btn.disabled = true;
+      btn.textContent = `⏳${remaining}`;
+      btn.classList.add('cooling');
+    }
+  });
+}
+
+// ---------- Панель действий ----------
+function renderActions() {
+  const panel = $('action-panel');
+  panel.innerHTML = '';
+  const me = STATE.players.find(p => p.id === YOU);
+  const cur = STATE.players[STATE.turnIndex];
+  const myTurn = cur && cur.id === YOU && !me.bankrupt;
+
+  if (STATE.phase === 'over') {
+    const w = STATE.players.find(p => p.id === STATE.winner);
+    panel.innerHTML = `<div class="action-title">🏆 Победа!</div><div class="action-sub">${w ? w.token + ' ' + w.name + ' выигрывает игру.' : ''}</div>`;
+    return;
+  }
+
+  if (STATE.phase === 'auction' && STATE.auction) {
+    renderAuction(panel, me);
+    return;
+  }
+
+  const title = document.createElement('div');
+  title.className = 'action-title';
+  title.textContent = myTurn ? 'Ваш ход' : `Ходит ${cur ? cur.name : ''}`;
+  panel.appendChild(title);
+
+  if (!myTurn) {
+    const sub = document.createElement('div');
+    sub.className = 'action-sub';
+    sub.textContent = 'Ожидайте свой ход. Можно управлять своей недвижимостью и предлагать сделки.';
+    panel.appendChild(sub);
+    renderPropertyManager(panel, me, false);
+    return;
+  }
+
+  // Свой ход
+  if (STATE.phase === 'roll') {
+    if (me.inJail) {
+      const sub = document.createElement('div'); sub.className = 'action-sub';
+      sub.textContent = 'Вы в тюрьме. Бросьте дубль, заплатите 50🪙 или используйте карту.';
+      panel.appendChild(sub);
+      const row = document.createElement('div'); row.className = 'action-row';
+      row.appendChild(btn('🎲 Бросить (на дубль)', () => act('roll'), 'btn-primary'));
+      if (me.money >= 50) row.appendChild(btn('💵 Заплатить 50🪙', () => act('payJail')));
+      if (me.getOutCards > 0) row.appendChild(btn('🎟️ Карта выхода', () => act('useJailCard')));
+      panel.appendChild(row);
+    } else {
+      const row = document.createElement('div'); row.className = 'action-row';
+      const again = STATE.doublesCount > 0;
+      row.appendChild(btn(again ? '🎲 Бросить ещё раз (дубль!)' : '🎲 Бросить кубики', () => act('roll'), 'btn-primary'));
+      panel.appendChild(row);
+    }
+  } else if (STATE.phase === 'buy') {
+    const t = BOARD[STATE.pendingPos];
+    const sub = document.createElement('div'); sub.className = 'action-sub';
+    sub.innerHTML = `«<b>${t.name}</b>» свободна. Цена <b>${t.price}🪙</b>.`;
+    panel.appendChild(sub);
+    const row = document.createElement('div'); row.className = 'action-row';
+    const buyBtn = btn(`🏷️ Купить за ${t.price}🪙`, () => act('buy'), 'btn-primary');
+    buyBtn.disabled = me.money < t.price;
+    row.appendChild(buyBtn);
+    row.appendChild(btn('🔨 На аукцион', () => act('declineBuy')));
+    panel.appendChild(row);
+  } else if (STATE.phase === 'end') {
+    const sub = document.createElement('div'); sub.className = 'action-sub';
+    sub.textContent = 'Стройте, закладывайте, торгуйте — затем завершите ход.';
+    panel.appendChild(sub);
+    const row = document.createElement('div'); row.className = 'action-row';
+    row.appendChild(btn('✅ Завершить ход', () => act('endTurn'), 'btn-primary'));
+    panel.appendChild(row);
+  }
+
+  // банкротство добровольно если деньги <0 невозможно, но даём кнопку выхода
+  if (me.money < 0 || myTurn) {
+    // менеджер недвижимости + банкротство
+  }
+  renderPropertyManager(panel, me, true);
+
+  const dangerRow = document.createElement('div'); dangerRow.className = 'action-row';
+  dangerRow.appendChild(btn('🤝 Предложить сделку', openTradeModal));
+  if (myTurn) {
+    const bk = btn('💥 Сдаться (банкрот)', () => { if (confirm('Объявить себя банкротом?')) act('declareBankruptcy'); });
+    dangerRow.appendChild(bk);
+  }
+  panel.appendChild(dangerRow);
+}
+
+function renderAuction(panel, me) {
+  const a = STATE.auction;
+  const t = BOARD[a.pos];
+  const turnPlayer = STATE.players[a.turn];
+  const myAuctionTurn = turnPlayer && turnPlayer.id === YOU && a.active.includes(YOU);
+  panel.innerHTML = `<div class="action-title">🔨 Аукцион</div>`;
+  const sub = document.createElement('div'); sub.className = 'action-sub';
+  const highName = a.highBidder ? STATE.players.find(p => p.id === a.highBidder).name : '—';
+  sub.innerHTML = `«<b>${t.name}</b>»<br>Текущая ставка: <b>${a.highBid}🪙</b> (${highName})<br>Сейчас ставит: <b>${turnPlayer ? turnPlayer.name : ''}</b>`;
+  panel.appendChild(sub);
+
+  if (myAuctionTurn) {
+    const inp = document.createElement('input');
+    inp.type = 'number'; inp.min = a.highBid + 1; inp.value = a.highBid + 10;
+    inp.style.margin = '8px 0';
+    panel.appendChild(inp);
+    const row = document.createElement('div'); row.className = 'action-row';
+    const bid = btn('Сделать ставку', () => act('auctionBid', { amount: Number(inp.value) }), 'btn-primary');
+    bid.disabled = me.money <= a.highBid;
+    row.appendChild(bid);
+    row.appendChild(btn('Пас', () => act('auctionPass')));
+    panel.appendChild(row);
+  } else {
+    const w = document.createElement('div'); w.className = 'action-sub';
+    w.textContent = a.active.includes(YOU) ? 'Ожидайте своей очереди делать ставку.' : 'Вы вышли из торгов.';
+    panel.appendChild(w);
+  }
+}
+
+function renderPropertyManager(panel, me, isMyTurn) {
+  const mine = Object.keys(STATE.ownership)
+    .map(Number)
+    .filter(pos => STATE.ownership[pos].owner === YOU)
+    .sort((a, b) => a - b);
+  if (mine.length === 0) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'prop-manage';
+  const h = document.createElement('h3'); h.textContent = 'Моя недвижимость'; h.style.margin = '6px 0 0';
+  panel.appendChild(h);
+  mine.forEach(pos => {
+    const t = BOARD[pos];
+    const o = STATE.ownership[pos];
+    const item = document.createElement('div');
+    item.className = 'prop-item';
+    const barColor = t.group ? GROUPS[t.group].color : '#888';
+    let label = t.name;
+    if (t.type === 'street' && o.houses > 0) label += o.houses === 5 ? ' 🌟' : ' ' + '⭐'.repeat(o.houses);
+    if (o.mortgaged) label += ' (залог)';
+    item.innerHTML = `<div class="pi-bar" style="background:${barColor}"></div>${propThumb(t)}<div class="pi-name">${label}</div>`;
+
+    // кнопки
+    if (t.type === 'street' && !o.mortgaged) {
+      const canBuild = ownsFullGroupClient(t.group) && o.houses < 5;
+      if (canBuild) item.appendChild(smallBtn('🏠+', () => act('build', { pos })));
+      if (o.houses > 0) item.appendChild(smallBtn('🏠−', () => act('sellHouse', { pos })));
+    }
+    if (!o.mortgaged && (t.type !== 'street' || o.houses === 0)) {
+      item.appendChild(smallBtn('Заложить', () => act('mortgage', { pos })));
+    }
+    if (o.mortgaged) {
+      item.appendChild(smallBtn('Выкупить', () => act('unmortgage', { pos })));
+    }
+    wrap.appendChild(item);
+  });
+  panel.appendChild(wrap);
+}
+
+function ownsFullGroupClient(group) {
+  if (!group) return false;
+  const tiles = BOARD.filter(t => t.group === group);
+  return tiles.every(t => STATE.ownership[t.pos] && STATE.ownership[t.pos].owner === YOU);
+}
+
+function ownsFullGroupBy(group, ownerId) {
+  if (!group) return false;
+  const tiles = BOARD.filter(t => t.group === group);
+  return tiles.length > 0 && tiles.every(t => STATE.ownership[t.pos] && STATE.ownership[t.pos].owner === ownerId);
+}
+
+// Аренда, которую заплатит попавший на клетку (для отображения)
+function clientRentDisplay(t, o) {
+  if (t.type === 'street') {
+    let r;
+    if (o.houses > 0) r = t.rent[o.houses];
+    else r = ownsFullGroupBy(t.group, o.owner) ? t.rent[0] * 2 : t.rent[0];
+    return r + '🪙';
+  }
+  if (t.type === 'rail') {
+    const n = BOARD.filter(x => x.type === 'rail' && STATE.ownership[x.pos] && STATE.ownership[x.pos].owner === o.owner).length;
+    return [0, 25, 50, 100, 200][n] + '🪙';
+  }
+  if (t.type === 'utility') {
+    const n = BOARD.filter(x => x.type === 'utility' && STATE.ownership[x.pos] && STATE.ownership[x.pos].owner === o.owner).length;
+    return (n === 2 ? '×10' : '×4') + ' 🎲';
+  }
+  return '';
+}
+
+function btn(text, onclick, cls = '') {
+  const b = document.createElement('button');
+  b.className = 'btn ' + cls;
+  b.textContent = text;
+  b.onclick = onclick;
+  return b;
+}
+function smallBtn(text, onclick) {
+  const b = document.createElement('button');
+  b.className = 'btn btn-sm';
+  b.textContent = text;
+  b.onclick = onclick;
+  return b;
+}
+
+function renderLog() {
+  const logEl = $('log');
+  logEl.innerHTML = '';
+  STATE.log.forEach(line => {
+    const d = document.createElement('div');
+    d.textContent = line;
+    logEl.appendChild(d);
+  });
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+// ---------- Модальное окно клетки ----------
+function openTileModal(pos) {
+  const t = BOARD[pos];
+  const o = STATE.ownership[pos];
+  const modal = $('tile-modal');
+  const c = $('tile-modal-content');
+  let headColor = t.group ? GROUPS[t.group].color : '#2a2f47';
+  let rows = '';
+
+  if (t.type === 'street') {
+    rows += deedRow('Группа', GROUPS[t.group].name);
+    rows += deedRow('Цена', t.price + '🪙');
+    rows += deedRow('Аренда', t.rent[0] + '🪙');
+    rows += deedRow('Аренда (монополия)', t.rent[0] * 2 + '🪙');
+    rows += deedRow('С 1 домом', t.rent[1] + '🪙');
+    rows += deedRow('С 2 домами', t.rent[2] + '🪙');
+    rows += deedRow('С 3 домами', t.rent[3] + '🪙');
+    rows += deedRow('С 4 домами', t.rent[4] + '🪙');
+    rows += deedRow('🏨 Отель', t.rent[5] + '🪙');
+    rows += deedRow('Цена дома/отеля', t.house + '🪙');
+    rows += deedRow('Залог', Math.floor(t.price / 2) + '🪙');
+  } else if (t.type === 'rail') {
+    rows += deedRow('Цена', t.price + '🪙');
+    rows += deedRow('1 башня', '25🪙');
+    rows += deedRow('2 башни', '50🪙');
+    rows += deedRow('3 башни', '100🪙');
+    rows += deedRow('4 башни', '200🪙');
+    rows += deedRow('Залог', '100🪙');
+  } else if (t.type === 'utility') {
+    rows += deedRow('Цена', t.price + '🪙');
+    rows += deedRow('1 объект', '4× бросок');
+    rows += deedRow('2 объекта', '10× бросок');
+    rows += deedRow('Залог', '75🪙');
+  } else if (t.type === 'tax') {
+    rows += deedRow('Налог', t.amount + '🪙');
+  } else {
+    rows += deedRow('Тип', tileTypeName(t.type));
+  }
+
+  if (o) {
+    const owner = STATE.players.find(p => p.id === o.owner);
+    rows = deedRow('Владелец', owner ? owner.token + ' ' + owner.name : '—') + rows;
+    if (o.mortgaged) rows = deedRow('Статус', '🏦 Заложено') + rows;
+  } else if (t.price) {
+    rows = deedRow('Владелец', 'Свободно') + rows;
+  }
+
+  let desc = tileDescription(t);
+  if (t.img && desc) desc = desc.replace(/^\s*[^\s<]+\s+/, ''); // убрать ведущий эмодзи, если есть фото
+  c.innerHTML = `
+    <div class="deed">
+      <div class="deed-head" style="background:${headColor}">
+        ${t.img ? `<img class="dh-photo" src="${t.img}" alt="${t.name}" onerror="this.classList.add('img-fail')"><div class="dh-icon dh-fb">${t.icon || '🎩'}</div>` : `<div class="dh-icon">${t.icon || '🎩'}</div>`}
+        <div class="dh-name">${t.name}</div>
+        ${t.group ? `<div class="dh-group">${GROUPS[t.group].name}</div>` : ''}
+      </div>
+      <div class="deed-body">
+        ${desc ? `<div class="deed-desc">${desc}</div>` : ''}
+        ${rows}
+      </div>
+      <div class="modal-actions"><button class="btn modal-close">Закрыть</button></div>
+    </div>`;
+  modal.classList.remove('hidden');
+  c.querySelector('.modal-close').onclick = () => modal.classList.add('hidden');
+  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+}
+function deedRow(l, v) { return `<div class="deed-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`; }
+function tileTypeName(type) {
+  return { go: 'Фонтан', jail: 'Респаун (ожидание)', parking: 'Лагерь крипов', gotojail: 'Гибель', chance: 'Руна', chest: 'Курьер' }[type] || type;
+}
+
+// Описание клетки для карточки
+function tileDescription(t) {
+  switch (t.type) {
+    case 'go':
+      return '🌀 <b>Фонтан</b> — точка возрождения вашей команды. Каждый раз, проходя или попадая сюда, вы получаете <b>200🪙</b> золота за круг.';
+    case 'jail':
+      return '⏳ <b>Респаун.</b> Если вы здесь проездом — просто отдыхаете, ничего не теряете. Если вас сюда отправили после гибели — вы ждёте возрождения: бросьте дубль, заплатите <b>50🪙</b> за выкуп или используйте <b>свиток Aegis</b>, чтобы вернуться в бой.';
+    case 'parking':
+      return '🐉 <b>Лагерь крипов.</b> Нейтральная территория — фармите спокойно. Ничего не происходит, ход просто переходит дальше.';
+    case 'gotojail':
+      return '⚰️ <b>Вы убиты!</b> Немедленно отправляйтесь на Респаун. Золото за круг при этом не начисляется.';
+    case 'chance':
+      return '🔮 <b>Руна.</b> Возьмите карту руны — это случайное событие: золото, телепорт по карте, гибель, бонус First Blood или спасительный свиток Aegis.';
+    case 'chest':
+      return '📦 <b>Курьер.</b> Курьер доставил карту — может быть бонус или штраф: золото, продажа артефакта, выкуп, награда за серию убийств или потеря золота.';
+    case 'street':
+      return `🦸 <b>Герой роли «${GROUPS[t.group].name}».</b> Купите его, чтобы соперники платили вам за заход. Соберите всю роль (цветную группу) — аренда удвоится, и можно строить дома и отели, резко повышая плату.`;
+    case 'rail':
+      return '🗼 <b>Башня.</b> Купите, чтобы брать пошлину за заход. Чем больше башен в ваших руках, тем выше плата: <b>25 / 50 / 100 / 200🪙</b> за 1, 2, 3 и 4 башни.';
+    case 'utility':
+      return '🛒 <b>Магазин.</b> Пошлина зависит от броска кубиков: <b>×4</b> от суммы кубиков, а если у владельца оба магазина — <b>×10</b>.';
+    case 'tax':
+      return t.amount >= 200
+        ? '💀 <b>Выкуп (Buyback).</b> Заплатите <b>200🪙</b> золота в банк, чтобы вернуться в строй.'
+        : '💎 <b>Налог на артефакты.</b> Заплатите <b>100🪙</b> золота в банк за свои закупки.';
+    default:
+      return '';
+  }
+}
+
+// ---------- Сделки ----------
+function openTradeModal() {
+  const me = STATE.players.find(p => p.id === YOU);
+  const others = STATE.players.filter(p => p.id !== YOU && !p.bankrupt);
+  if (others.length === 0) return;
+  const modal = $('trade-modal');
+  const c = $('trade-modal-content');
+
+  const myProps = Object.keys(STATE.ownership).map(Number).filter(pos => STATE.ownership[pos].owner === YOU && STATE.ownership[pos].houses === 0);
+
+  const targetOptions = others.map(p => `<option value="${p.id}">${p.token} ${p.name}</option>`).join('');
+
+  c.innerHTML = `
+    <div class="deed-head" style="background:#2a2f47"><div class="dh-name">🤝 Сделка</div></div>
+    <div class="trade-grid">
+      <div>
+        <h4>Кому</h4>
+        <select id="trade-target" style="width:100%;padding:10px;border-radius:8px;background:var(--bg2);color:var(--ink);border:1px solid var(--line)">${targetOptions}</select>
+      </div>
+      <div>
+        <h4>Вы отдаёте</h4>
+        <label>Деньги (🪙)</label>
+        <input id="offer-money" type="number" min="0" value="0" max="${me.money}">
+        <div class="trade-props" id="offer-props">${myProps.map(pos => propCheck('offer', pos)).join('') || '<span class="action-sub">нет активов без домов</span>'}</div>
+      </div>
+      <div>
+        <h4>Вы получаете</h4>
+        <label>Деньги (🪙)</label>
+        <input id="req-money" type="number" min="0" value="0">
+        <div class="trade-props" id="req-props"></div>
+      </div>
+      <div class="action-row">
+        <button class="btn btn-primary" id="send-trade">Отправить предложение</button>
+        <button class="btn" id="close-trade">Отмена</button>
+      </div>
+    </div>`;
+  modal.classList.remove('hidden');
+
+  const fillReq = () => {
+    const tid = $('trade-target').value;
+    const theirProps = Object.keys(STATE.ownership).map(Number).filter(pos => STATE.ownership[pos].owner === tid && STATE.ownership[pos].houses === 0);
+    $('req-props').innerHTML = theirProps.map(pos => propCheck('req', pos)).join('') || '<span class="action-sub">нет активов без домов</span>';
+  };
+  fillReq();
+  $('trade-target').onchange = fillReq;
+
+  $('close-trade').onclick = () => modal.classList.add('hidden');
+  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+  $('send-trade').onclick = () => {
+    const to = $('trade-target').value;
+    const offerProps = [...c.querySelectorAll('#offer-props input:checked')].map(i => Number(i.value));
+    const reqProps = [...c.querySelectorAll('#req-props input:checked')].map(i => Number(i.value));
+    act('proposeTrade', {
+      to,
+      offerMoney: Number($('offer-money').value) || 0,
+      reqMoney: Number($('req-money').value) || 0,
+      offerProps, reqProps,
+    });
+    modal.classList.add('hidden');
+  };
+}
+function propCheck(side, pos) {
+  const t = BOARD[pos];
+  return `<label><input type="checkbox" value="${pos}">${propThumb(t)} ${t.name}</label>`;
+}
+
+// показать входящее предложение сделки
+let tradeShownFor = null;
+function renderTrade() {
+  const tr = STATE.trade;
+  const modal = $('trade-modal');
+  if (tr && tr.to === YOU) {
+    if (tradeShownFor === JSON.stringify(tr)) return;
+    tradeShownFor = JSON.stringify(tr);
+    const c = $('trade-modal-content');
+    const give = describeTrade(tr.offerProps, tr.offerMoney);
+    const get = describeTrade(tr.reqProps, tr.reqMoney);
+    c.innerHTML = `
+      <div class="deed-head" style="background:#2a2f47"><div class="dh-name">🤝 Предложение от ${tr.fromName}</div></div>
+      <div class="trade-grid">
+        <div><h4>Вам предлагают</h4><div class="action-sub">${give || 'ничего'}</div></div>
+        <div><h4>Взамен просят</h4><div class="action-sub">${get || 'ничего'}</div></div>
+        <div class="action-row">
+          <button class="btn btn-primary" id="accept-trade">Принять</button>
+          <button class="btn" id="decline-trade">Отклонить</button>
+        </div>
+      </div>`;
+    modal.classList.remove('hidden');
+    $('accept-trade').onclick = () => { act('respondTrade', { accept: true }); modal.classList.add('hidden'); };
+    $('decline-trade').onclick = () => { act('respondTrade', { accept: false }); modal.classList.add('hidden'); };
+  } else if (!tr) {
+    tradeShownFor = null;
+  }
+}
+function describeTrade(props, money) {
+  const parts = [];
+  if (money > 0) parts.push(`${money}🪙`);
+  props.forEach(pos => parts.push(`${propThumb(BOARD[pos])} ${BOARD[pos].name}`));
+  return parts.join(', ');
+}
