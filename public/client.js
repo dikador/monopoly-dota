@@ -25,6 +25,7 @@ let displayPos = {};               // отображаемая клетка фи
 let movingIds = new Set();         // игроки, чьи фишки сейчас шагают
 let moveDir = {};                  // направление шага (+1/-1) для плавного перемещения
 let moveQueue = {};                // очередь клеток-целей для пошагового прохода по пути
+let animWatchdog = null;           // страховочный таймер разблокировки
 let hoppingIds = new Set();        // фишки, которым на этом шаге добавить «прыжок»
 let prevMoney = {};                // прошлый баланс игроков (для звука монет)
 let prevOwnedCount = null;         // число купленных клеток (для звука покупки)
@@ -131,10 +132,11 @@ socket.on('state', (s) => {
   routeScreen();
   const diceChanged = s.dice && (s.dice[0] !== prevDice[0] || s.dice[1] !== prevDice[1]);
   if (BOARD) {
-    if (diceChanged) turnAnimating = true; // прячем оповещения/кнопки до прихода фишки
+    if (diceChanged) turnAnimating = true;          // прячем кнопки до прихода фишки
+    else if (movingIds.size === 0) turnAnimating = false; // нет активной анимации — точно можно ходить
     renderAll();
     if (diceChanged) { animateDice(); playClip('dice'); startMoves(); }
-    else { turnAnimating = false; animateMoves(); }
+    else { animateMoves(); }
   }
   // оплата аренды завершилась? (pendingPay был и пропал)
   let rentEvent = false;
@@ -608,14 +610,29 @@ function startMoves() {
     }
   });
 
-  if (!movingIds.has(STATE.currentPlayerId)) finishTurnAnim();
+  if (movingIds.size === 0) finishTurnAnim();
+  else armAnimWatchdog();
 }
 
 // Фишка прошла ВЕСЬ путь — показать оповещения и кнопки хода
 function finishTurnAnim() {
+  clearTimeout(animWatchdog);
   if (!turnAnimating) return;
   turnAnimating = false;
   if (STATE && STATE.started) { renderActions(); renderPayPrompt(); }
+}
+
+// Страховка: если анимация почему-то зависла — разблокировать через 12с
+function armAnimWatchdog() {
+  clearTimeout(animWatchdog);
+  animWatchdog = setTimeout(() => {
+    movingIds.clear();
+    moveQueue = {};
+    if (STATE && STATE.players) STATE.players.forEach(p => { displayPos[p.id] = p.pos; });
+    placeTokens();
+    turnAnimating = false;
+    if (STATE && STATE.started) { renderActions(); renderPayPrompt(); }
+  }, 12000);
 }
 
 // Для нестроевых состояний (без броска): инициализация и подтягивание позиций
@@ -636,7 +653,7 @@ function walkStep(pid) {
   while (q.length && displayPos[pid] === q[0]) q.shift();
   if (q.length === 0) { // весь путь пройден
     movingIds.delete(pid); placeTokens();
-    if (pid === STATE.currentPlayerId) finishTurnAnim();
+    if (movingIds.size === 0) finishTurnAnim();
     return;
   }
   const target = q[0];
@@ -644,7 +661,7 @@ function walkStep(pid) {
   if (player.inJail && target === 10) {
     displayPos[pid] = 10; moveQueue[pid] = [];
     movingIds.delete(pid); placeTokens();
-    if (pid === STATE.currentPlayerId) finishTurnAnim();
+    if (movingIds.size === 0) finishTurnAnim();
     return;
   }
   // направление к текущей цели: вперёд, назад — только короткий этап (карта «на N назад»)
@@ -789,6 +806,23 @@ function renderActions() {
     return;
   }
 
+  // Режим долга — не хватает денег: продать/заложить, затем заплатить или банкротство
+  if (STATE.phase === 'debt' && STATE.pendingDebt) {
+    const need = STATE.pendingDebt.amount;
+    const enough = me.money >= need;
+    const sub = document.createElement('div'); sub.className = 'action-sub';
+    sub.innerHTML = `⚠️ Не хватает денег! Нужно <b>${need}🪙</b>, у вас <b>${me.money}🪙</b>.<br>Продайте дома или заложите имущество ниже, затем заплатите — или объявите банкротство.`;
+    panel.appendChild(sub);
+    const row = document.createElement('div'); row.className = 'action-row';
+    const payBtn = btn(`💸 Заплатить ${need}🪙`, () => act('payDebt'), 'btn-primary');
+    payBtn.disabled = !enough;
+    row.appendChild(payBtn);
+    row.appendChild(btn('💥 Банкротство', () => { if (confirm('Объявить себя банкротом? Всё имущество перейдёт кредитору/банку.')) act('declareBankruptcy'); }));
+    panel.appendChild(row);
+    renderPropertyManager(panel, me, true);
+    return;
+  }
+
   // Свой ход
   if (STATE.phase === 'roll') {
     if (me.inJail) {
@@ -901,8 +935,15 @@ function renderPropertyManager(panel, me, isMyTurn) {
 
     // кнопки
     if (t.type === 'street' && !o.mortgaged) {
-      const canBuild = ownsFullGroupClient(t.group) && o.houses < 5;
+      const builtThisTurn = STATE.builtGroups && STATE.builtGroups[t.group];
+      const canBuild = ownsFullGroupClient(t.group) && o.houses < 5 && !builtThisTurn;
       if (canBuild) item.appendChild(smallBtn('🏠+', () => act('build', { pos })));
+      else if (builtThisTurn && ownsFullGroupClient(t.group) && o.houses < 5) {
+        const b = smallBtn('🏠+', () => {});
+        b.disabled = true;
+        b.title = 'Эту монополию уже улучшали в этом ходу';
+        item.appendChild(b);
+      }
       if (o.houses > 0) item.appendChild(smallBtn('🏠−', () => act('sellHouse', { pos })));
     }
     if (!o.mortgaged && (t.type !== 'street' || o.houses === 0)) {

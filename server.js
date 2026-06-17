@@ -75,6 +75,9 @@ function newRoom(code) {
     pendingPay: null,
     animFor: null,    // id игрока, чьё перемещение анимируется
     animPath: [],     // последовательность клеток для прохода фишки
+    builtGroups: {},  // какие монополии уже улучшали в этом ходу
+    pendingDebt: null,    // долг, который игрок должен погасить (продав имущество) или обанкротиться
+    debtReturnPhase: null,// фаза, в которую вернуться после погашения долга
     ownership: {}, // pos -> { owner, houses(0-5), mortgaged }
     chanceDeck: shuffle(CHANCE.map((_, i) => i)),
     chestDeck: shuffle(CHEST.map((_, i) => i)),
@@ -160,6 +163,8 @@ function publicState(room) {
     pendingPay: room.pendingPay,
     animFor: room.animFor,
     animPath: room.animPath,
+    builtGroups: room.builtGroups,
+    pendingDebt: room.pendingDebt,
     ownership: room.ownership,
     auction: room.auction,
     trade: room.trade,
@@ -200,6 +205,9 @@ function nextTurn(room) {
   room.doublesCount = 0;
   room.pendingPos = null;
   room.pendingPay = null;
+  room.pendingDebt = null;
+  room.debtReturnPhase = null;
+  room.builtGroups = {}; // новый ход — снова можно улучшить каждую монополию по разу
   if (checkWin(room)) return;
   let i = room.turnIndex;
   for (let k = 0; k < room.players.length; k++) {
@@ -268,9 +276,10 @@ function landOn(room, p, diceSum) {
       setPendingPay(room, p, owner, rent, t);
     }
   } else if (t.type === 'tax') {
-    log(room, `${p.token} ${p.name} платит ${t.name.toLowerCase()} ${t.amount}🪙.`);
     if (p.pos === 4) io.to(room.code).emit('notify', { type: 'buyback' }); // звук выкупа
-    if (!pay(room, p, -t.amount)) startBankruptcy(room, p, null, t.amount);
+    if (charge(room, p, t.amount, null, 'end')) {
+      log(room, `${p.token} ${p.name} платит ${t.name.toLowerCase()} ${t.amount}🪙.`);
+    }
   } else if (t.type === 'gotojail') {
     sendToJail(room, p);
   } else if (t.type === 'chance') {
@@ -281,13 +290,6 @@ function landOn(room, p, diceSum) {
   } else {
     // go / jail(visiting) / parking
     if (t.type === 'parking') log(room, `${p.token} ${p.name} отдыхает на парковке.`);
-  }
-}
-
-function payRentOrBankrupt(room, p, owner, rent, t) {
-  log(room, `${p.token} ${p.name} платит аренду ${rent}🪙 игроку ${owner ? owner.name : 'банку'} за «${t.name}».`);
-  if (!pay(room, p, -rent, owner)) {
-    startBankruptcy(room, p, owner, rent);
   }
 }
 
@@ -335,7 +337,8 @@ function drawCard(room, p, kind, diceSum) {
 function applyCard(room, p, card, diceSum, deck, idx) {
   switch (card.action) {
     case 'money':
-      if (!pay(room, p, card.amount)) startBankruptcy(room, p, null, -card.amount);
+      if (card.amount >= 0) p.money += card.amount;
+      else charge(room, p, -card.amount, null, 'end');
       break;
     case 'moveTo': {
       moveTo(room, p, card.pos, true);
@@ -367,7 +370,7 @@ function applyCard(room, p, card, diceSum, deck, idx) {
       const cost = houses * card.perHouse + hotels * card.perHotel;
       if (cost > 0) {
         log(room, `Ремонт: ${houses} дом./${hotels} отел. = ${cost}🪙.`);
-        if (!pay(room, p, -cost)) startBankruptcy(room, p, null, cost);
+        charge(room, p, cost, null, 'end');
       }
       break;
     }
@@ -375,16 +378,9 @@ function applyCard(room, p, card, diceSum, deck, idx) {
       let total = 0;
       for (const other of activePlayers(room)) {
         if (other.id === p.id) continue;
-        if (other.money >= card.amount) {
-          other.money -= card.amount;
-          total += card.amount;
-        } else {
-          total += other.money;
-          const remaining = card.amount - other.money;
-          other.money = 0;
-          // если не хватило — частично; упрощённо запускаем банкротство в пользу p
-          startBankruptcy(room, other, p, remaining);
-        }
+        const give = Math.min(card.amount, other.money); // платят сколько есть
+        other.money -= give;
+        total += give;
       }
       p.money += total;
       break;
@@ -411,60 +407,49 @@ function applyCard(room, p, card, diceSum, deck, idx) {
   }
 }
 
-// ---------- Банкротство ----------
-function startBankruptcy(room, debtor, creditor, debt) {
-  // Игрок не может заплатить. Сначала даём шанс продать дома/заложить — но упрощённо:
-  // авто-ликвидация: продаём дома и закладываем всё, пока хватает.
-  liquidateAuto(room, debtor);
-  if (debtor.money >= debt) {
-    // смог рассчитаться
-    debtor.money -= debt;
-    if (creditor) creditor.money += debt;
-    log(room, `${debtor.name} рассчитался, продав активы.`);
-    return;
+// ---------- Оплата / долг / банкротство ----------
+// Списать сумму; если не хватает — перевести игрока в режим долга (он сам продаёт/закладывает).
+function charge(room, p, amount, creditorId, returnPhase) {
+  const creditor = creditorId ? playerById(room, creditorId) : null;
+  if (p.money >= amount) {
+    p.money -= amount;
+    if (creditor) creditor.money += amount;
+    return true;
   }
-  // банкротство
-  log(room, `💥 ${debtor.name} банкрот!`);
+  room.pendingDebt = { amount, toId: creditorId || null };
+  room.debtReturnPhase = returnPhase || 'end';
+  room.phase = 'debt';
+  log(room, `⚠️ ${p.token} ${p.name}: не хватает ${amount}🪙. Продайте дома/заложите имущество или объявите банкротство.`);
+  return false;
+}
+
+// Банкротство: активы — кредитору (или в банк). Без авто-распродажи «на выживание».
+function declareBankrupt(room, debtor, creditorId) {
+  const creditor = creditorId ? playerById(room, creditorId) : null;
+  // дома продаются банку, деньги идут в общий расчёт
+  for (const pos in room.ownership) {
+    const o = room.ownership[pos];
+    if (o.owner === debtor.id && o.houses > 0) {
+      debtor.money += o.houses * Math.floor(tile(Number(pos)).house / 2);
+      o.houses = 0;
+    }
+  }
   if (creditor) {
     creditor.money += debtor.money;
-    // передать собственность
     for (const pos in room.ownership) {
-      if (room.ownership[pos].owner === debtor.id) {
-        room.ownership[pos].owner = creditor.id;
-      }
+      if (room.ownership[pos].owner === debtor.id) room.ownership[pos].owner = creditor.id;
     }
     creditor.getOutCards += debtor.getOutCards;
-    log(room, `Активы переходят к ${creditor.name}.`);
+    log(room, `💥 ${debtor.name} банкрот! Активы переходят к ${creditor.name}.`);
   } else {
-    // банку — освобождаем собственность
     for (const pos in room.ownership) {
       if (room.ownership[pos].owner === debtor.id) delete room.ownership[pos];
     }
+    log(room, `💥 ${debtor.name} банкрот! Активы возвращаются в банк.`);
   }
   debtor.money = 0;
   debtor.getOutCards = 0;
   debtor.bankrupt = true;
-}
-
-function liquidateAuto(room, p) {
-  // продать все дома
-  for (const pos in room.ownership) {
-    const o = room.ownership[pos];
-    const t = tile(Number(pos));
-    if (o.owner === p.id && o.houses > 0) {
-      p.money += o.houses * Math.floor(t.house / 2);
-      o.houses = 0;
-    }
-  }
-  // заложить всё незаложенное
-  for (const pos in room.ownership) {
-    const o = room.ownership[pos];
-    const t = tile(Number(pos));
-    if (o.owner === p.id && !o.mortgaged) {
-      o.mortgaged = true;
-      p.money += Math.floor(t.price / 2);
-    }
-  }
 }
 
 // ---------- Действия игроков ----------
@@ -490,12 +475,15 @@ function doRoll(room, p) {
       p.jailTurns += 1;
       log(room, `${p.name} на респауне, бросок ${d1}-${d2} — не дубль.`);
       if (p.jailTurns >= 3) {
-        log(room, `${p.name} ждал 3 хода — платит 50🪙 за выкуп и возрождается.`);
-        if (!pay(room, p, -50)) startBankruptcy(room, p, null, 50);
+        log(room, `${p.name} ждал 3 хода — нужно заплатить 50🪙 за выкуп.`);
+        const paid = charge(room, p, 50, null, 'end');
         p.inJail = false;
         p.jailTurns = 0;
-        moveTo(room, p, (p.pos + sum) % 40, true);
-        landOn(room, p, sum);
+        if (paid) {
+          moveTo(room, p, (p.pos + sum) % 40, true);
+          landOn(room, p, sum);
+        }
+        // если не хватило — режим долга, ход завершится после оплаты/банкротства
       } else {
         room.phase = 'end';
       }
@@ -639,7 +627,7 @@ io.on('connection', (socket) => {
     if (room.started && !p.bankrupt) {
       const wasCurrent = currentPlayer(room) && currentPlayer(room).id === p.id;
       log(room, `🚪 ${p.name} вышел из игры.`);
-      startBankruptcy(room, p, null, Infinity); // активы возвращаются в банк
+      declareBankrupt(room, p, null); // активы возвращаются в банк
       if (room.phase !== 'over' && wasCurrent) {
         room.phase = 'end';
         nextTurn(room);
@@ -774,11 +762,28 @@ function handleAction(room, sid, msg) {
     case 'payRent': {
       if (!isCurrent || room.phase !== 'pay' || !room.pendingPay) return;
       const pp = room.pendingPay;
-      const owner = pp.toId ? playerById(room, pp.toId) : null;
       room.pendingPay = null;
-      payRentOrBankrupt(room, p, owner, pp.amount, { name: pp.tileName });
-      if (p.bankrupt) nextTurn(room);
-      else room.phase = canRollAgain(room, p) ? 'roll' : 'end';
+      const back = canRollAgain(room, p) ? 'roll' : 'end';
+      if (charge(room, p, pp.amount, pp.toId || null, back)) {
+        const owner = pp.toId ? playerById(room, pp.toId) : null;
+        log(room, `${p.token} ${p.name} платит аренду ${pp.amount}🪙 игроку ${owner ? owner.name : 'банку'} за «${pp.tileName}».`);
+        room.phase = back;
+      }
+      // если не хватило — charge перевёл в режим долга
+      return;
+    }
+
+    case 'payDebt': {
+      if (!isCurrent || room.phase !== 'debt' || !room.pendingDebt) return;
+      const d = room.pendingDebt;
+      if (p.money < d.amount) return; // ещё не хватает — продайте/заложите
+      const creditor = d.toId ? playerById(room, d.toId) : null;
+      p.money -= d.amount;
+      if (creditor) creditor.money += d.amount;
+      log(room, `${p.token} ${p.name} платит ${d.amount}🪙${creditor ? ' игроку ' + creditor.name : ''}.`);
+      room.pendingDebt = null;
+      room.phase = room.debtReturnPhase || 'end';
+      room.debtReturnPhase = null;
       return;
     }
 
@@ -830,11 +835,14 @@ function handleAction(room, sid, msg) {
       nextTurn(room);
       return;
 
-    case 'declareBankruptcy':
+    case 'declareBankruptcy': {
       if (!isCurrent) return;
-      startBankruptcy(room, p, null, Infinity);
+      const creditorId = (room.phase === 'debt' && room.pendingDebt) ? room.pendingDebt.toId : null;
+      declareBankrupt(room, p, creditorId);
+      room.pendingDebt = null; room.debtReturnPhase = null; room.pendingPay = null;
       if (room.phase !== 'over') nextTurn(room);
       return;
+    }
 
     case 'proposeTrade':
       proposeTrade(room, p, msg);
@@ -945,12 +953,15 @@ function buildHouse(room, p, pos) {
   const groupTiles = BOARD.filter(x => x.group === t.group);
   if (groupTiles.some(x => room.ownership[x.pos].mortgaged)) { log(room, 'В группе есть заложенный объект.'); return; }
   if (o.houses >= 5) { log(room, 'Уже отель.'); return; }
+  // одну монополию можно улучшать только раз за ход
+  if (room.builtGroups[t.group]) { log(room, 'Эту монополию уже улучшали в этом ходу.'); return; }
   // равномерная застройка
   const minHouses = Math.min(...groupTiles.map(x => room.ownership[x.pos].houses));
   if (o.houses > minHouses) { log(room, 'Стройте равномерно по группе.'); return; }
   if (p.money < t.house) { log(room, 'Недостаточно денег.'); return; }
   p.money -= t.house;
   o.houses += 1;
+  room.builtGroups[t.group] = true; // эта монополия улучшена в этом ходу
   log(room, `🏠 ${p.name} строит ${o.houses === 5 ? 'отель' : 'дом'} на «${t.name}».`);
 }
 
