@@ -24,8 +24,12 @@ let clientNowAtState = Date.now(); // момент получения после
 let displayPos = {};               // отображаемая клетка фишки (для пошаговой анимации хода)
 let movingIds = new Set();         // игроки, чьи фишки сейчас шагают
 let moveDir = {};                  // направление шага (+1/-1) для плавного перемещения
+let moveQueue = {};                // очередь клеток-целей для пошагового прохода по пути
 let hoppingIds = new Set();        // фишки, которым на этом шаге добавить «прыжок»
 let prevMoney = {};                // прошлый баланс игроков (для звука монет)
+let prevOwnedCount = null;         // число купленных клеток (для звука покупки)
+let turnAnimating = false;         // фишка ещё идёт — прячем оповещения/кнопки хода
+let prevPay = null;                // незакрытая оплата аренды из прошлого состояния (для звука монет)
 let payShownFor = null;            // чтобы не дублировать звук окна оплаты
 let sfxVolume = parseInt(localStorage.getItem('monopoly_sfx_vol') || '70', 10) / 100; // громкость звуков
 let sfxMuted = localStorage.getItem('monopoly_sfx_muted') === '1';
@@ -125,16 +129,31 @@ socket.on('state', (s) => {
   clientNowAtState = Date.now();
   if (!YOU) YOU = socket.id;
   routeScreen();
-  if (BOARD) { renderAll(); animateMoves(); }
-  // анимация и звук кубиков
-  if (s.dice && (s.dice[0] !== prevDice[0] || s.dice[1] !== prevDice[1])) { animateDice(); playSnd('dice'); }
-  // звук изменения баланса (мой)
+  const diceChanged = s.dice && (s.dice[0] !== prevDice[0] || s.dice[1] !== prevDice[1]);
+  if (BOARD) {
+    if (diceChanged) turnAnimating = true; // прячем оповещения/кнопки до прихода фишки
+    renderAll();
+    if (diceChanged) { animateDice(); playClip('dice'); startMoves(); }
+    else { turnAnimating = false; animateMoves(); }
+  }
+  // оплата аренды завершилась? (pendingPay был и пропал)
+  let rentEvent = false;
+  if (prevPay && !STATE.pendingPay && (YOU === prevPay.toId || YOU === prevPay.fromId)) rentEvent = true;
+  // звук изменения баланса (мой): аренда — отдельным звуком монет
   const meP = STATE.players && STATE.players.find(p => p.id === YOU);
   if (meP) {
     const prev = prevMoney[YOU];
-    if (prev !== undefined && meP.money !== prev) playSnd(meP.money > prev ? 'coinIn' : 'coinOut');
+    if (prev !== undefined && meP.money !== prev) {
+      if (rentEvent) playClip('coins');
+      else playSnd(meP.money > prev ? 'coinIn' : 'coinOut');
+    }
   }
   if (STATE.players) STATE.players.forEach(p => { prevMoney[p.id] = p.money; });
+  prevPay = STATE.pendingPay ? { toId: STATE.pendingPay.toId, fromId: STATE.currentPlayerId } : null;
+  // звук покупки — когда появился новый владелец (покупка/аукцион)
+  const ownedCount = Object.keys(STATE.ownership || {}).length;
+  if (prevOwnedCount !== null && ownedCount > prevOwnedCount) playClip('buy');
+  prevOwnedCount = ownedCount;
 });
 
 // ---------- Уведомления и звук похвалы (как commend в Dota 2) ----------
@@ -150,19 +169,22 @@ socket.on('notify', (n) => {
     });
     playPraiseSound();
   } else if (n.type === 'buyback') {
-    playBuyback();
+    playClip('buyback');
+  } else if (n.type === 'rune') {
+    playClip('rune');
   }
 });
 
-// Звук выкупа (mp3) — с учётом громкости звуков
-let buybackAudio = null;
-function playBuyback() {
+// Воспроизведение mp3-клипов событий с учётом громкости звуков
+const clipCache = {};
+function playClip(name) {
   const v = sfxGain();
   if (v <= 0) return;
-  if (!buybackAudio) buybackAudio = new Audio('/buyback.mp3');
-  buybackAudio.volume = v;
-  buybackAudio.currentTime = 0;
-  buybackAudio.play().catch(() => {});
+  if (!clipCache[name]) clipCache[name] = new Audio('/' + name + '.mp3');
+  const a = clipCache[name];
+  a.volume = v;
+  a.currentTime = 0;
+  a.play().catch(() => {});
 }
 
 function showToast({ icon, title, text, sub, highlight }) {
@@ -268,7 +290,10 @@ function playSnd(name) {
     o.start(t + start); o.stop(t + start + dur + 0.03);
   };
   switch (name) {
-    case 'dice':    beep(220,140,'square',0.06,0.10,0); beep(260,160,'square',0.06,0.10,0.07); beep(200,120,'square',0.06,0.10,0.14); break;
+    case 'dice':
+      for (let i = 0; i < 6; i++) { const f = 170 + Math.random() * 200; beep(f, f * 0.8, 'square', 0.04, 0.09, i * 0.07); }
+      beep(150, 95, 'square', 0.11, 0.14, 0.46); // финальный удар, кубики легли
+      break;
     case 'step':    beep(340,300,'sine',0.045,0.06,0); break;
     case 'coinIn':  beep(659,988,'triangle',0.11,0.16,0); beep(988,1319,'triangle',0.11,0.14,0.08); break;
     case 'coinOut': beep(440,330,'triangle',0.13,0.15,0); beep(294,220,'triangle',0.15,0.13,0.09); break;
@@ -556,31 +581,77 @@ function placeTokens() {
   });
 }
 
-// Запуск анимации перемещения фишек после нового состояния
+// Запуск перемещения после «проигрывания» кубиков (фишка идёт по пути этап за этапом)
+function startMoves() {
+  if (!STATE || !STATE.started) return;
+  // инициализация новых фишек — без анимации
+  STATE.players.forEach(p => { if (displayPos[p.id] === undefined) displayPos[p.id] = p.pos; });
+
+  const mover = STATE.animFor;
+  let path = (STATE.animPath || []).slice();
+  if (mover && displayPos[mover] !== undefined) {
+    const fp = STATE.players.find(x => x.id === mover);
+    if (path.length === 0 && fp && displayPos[mover] !== fp.pos) path = [fp.pos]; // запасной вариант
+    if (path.length && !movingIds.has(mover)) {
+      moveQueue[mover] = path;
+      movingIds.add(mover);
+      walkStep(mover);
+    }
+  }
+  // прочие фишки, если вдруг сместились (без пути) — догнать к их позиции
+  STATE.players.forEach(p => {
+    if (p.id === mover) return;
+    if (displayPos[p.id] !== p.pos && !movingIds.has(p.id)) {
+      moveQueue[p.id] = [p.pos];
+      movingIds.add(p.id);
+      walkStep(p.id);
+    }
+  });
+
+  if (!movingIds.has(STATE.currentPlayerId)) finishTurnAnim();
+}
+
+// Фишка прошла ВЕСЬ путь — показать оповещения и кнопки хода
+function finishTurnAnim() {
+  if (!turnAnimating) return;
+  turnAnimating = false;
+  if (STATE && STATE.started) { renderActions(); renderPayPrompt(); }
+}
+
+// Для нестроевых состояний (без броска): инициализация и подтягивание позиций
 function animateMoves() {
   if (!STATE || !STATE.started) return;
   STATE.players.forEach(p => {
-    const to = p.pos;
-    if (displayPos[p.id] === undefined) { displayPos[p.id] = to; return; } // первый раз — без анимации
-    if (displayPos[p.id] === to || movingIds.has(p.id)) return;
-    // смерть/тюрьма — мгновенно на респаун, без шагов
-    if (p.inJail && to === 10) { displayPos[p.id] = to; placeTokens(); return; }
-    // обычное перемещение — плавно, шагами по кратчайшему направлению
-    const forward = (to - displayPos[p.id] + 40) % 40;
-    const backward = 40 - forward;
-    moveDir[p.id] = forward <= backward ? 1 : -1;
-    movingIds.add(p.id);
-    walkStep(p.id);
+    if (displayPos[p.id] === undefined) { displayPos[p.id] = p.pos; return; }
+    if (displayPos[p.id] !== p.pos && !movingIds.has(p.id)) displayPos[p.id] = p.pos;
   });
+  placeTokens();
 }
 
 function walkStep(pid) {
   const player = STATE.players.find(x => x.id === pid);
   if (!player) { movingIds.delete(pid); return; }
-  if (displayPos[pid] === player.pos) { movingIds.delete(pid); placeTokens(); return; }
-  // если по дороге игрок попал в тюрьму — мгновенно на респаун
-  if (player.inJail && player.pos === 10) { displayPos[pid] = 10; movingIds.delete(pid); placeTokens(); return; }
-  displayPos[pid] = (displayPos[pid] + (moveDir[pid] || 1) + 40) % 40;
+  let q = moveQueue[pid] || [];
+  // пропускаем уже достигнутые цели
+  while (q.length && displayPos[pid] === q[0]) q.shift();
+  if (q.length === 0) { // весь путь пройден
+    movingIds.delete(pid); placeTokens();
+    if (pid === STATE.currentPlayerId) finishTurnAnim();
+    return;
+  }
+  const target = q[0];
+  // телепорт на респаун (смерть/тюрьма)
+  if (player.inJail && target === 10) {
+    displayPos[pid] = 10; moveQueue[pid] = [];
+    movingIds.delete(pid); placeTokens();
+    if (pid === STATE.currentPlayerId) finishTurnAnim();
+    return;
+  }
+  // направление к текущей цели: вперёд, назад — только короткий этап (карта «на N назад»)
+  const forward = (target - displayPos[pid] + 40) % 40;
+  const backward = 40 - forward;
+  const dir = (backward >= 1 && backward <= 4) ? -1 : 1;
+  displayPos[pid] = (displayPos[pid] + dir + 40) % 40;
   hoppingIds.add(pid);
   playSnd('step');
   placeTokens();
@@ -695,6 +766,12 @@ function renderActions() {
 
   if (STATE.phase === 'auction' && STATE.auction) {
     renderAuction(panel, me);
+    return;
+  }
+
+  // пока фишка идёт — прячем кнопки/оповещения текущего игрока
+  if (myTurn && turnAnimating) {
+    panel.innerHTML = '<div class="action-title">Ваш ход</div><div class="action-sub">🎲 Фишка идёт к клетке…</div>';
     return;
   }
 
@@ -1007,7 +1084,8 @@ function renderPayPrompt() {
   const modal = $('pay-modal');
   if (!modal) return;
   const pp = STATE.pendingPay;
-  const mine = STATE.phase === 'pay' && pp && STATE.currentPlayerId === YOU;
+  // пока фишка идёт — окно оплаты не показываем
+  const mine = STATE.phase === 'pay' && pp && STATE.currentPlayerId === YOU && !turnAnimating;
   if (!mine) {
     modal.classList.add('hidden');
     if (!pp) payShownFor = null;

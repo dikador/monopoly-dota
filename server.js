@@ -73,6 +73,8 @@ function newRoom(code) {
     phase: 'lobby', // lobby | roll | buy | pay | auction | end | over
     pendingPos: null,
     pendingPay: null,
+    animFor: null,    // id игрока, чьё перемещение анимируется
+    animPath: [],     // последовательность клеток для прохода фишки
     ownership: {}, // pos -> { owner, houses(0-5), mortgaged }
     chanceDeck: shuffle(CHANCE.map((_, i) => i)),
     chestDeck: shuffle(CHEST.map((_, i) => i)),
@@ -156,6 +158,8 @@ function publicState(room) {
     doublesCount: room.doublesCount,
     pendingPos: room.pendingPos,
     pendingPay: room.pendingPay,
+    animFor: room.animFor,
+    animPath: room.animPath,
     ownership: room.ownership,
     auction: room.auction,
     trade: room.trade,
@@ -224,6 +228,7 @@ function sendToJail(room, p) {
   p.inJail = true;
   p.jailTurns = 0;
   room.doublesCount = 0;
+  if (room.animFor === p.id) room.animPath.push(10);
   log(room, `💀 ${p.name} погибает и отправляется на респаун.`);
 }
 
@@ -269,6 +274,7 @@ function landOn(room, p, diceSum) {
   } else if (t.type === 'gotojail') {
     sendToJail(room, p);
   } else if (t.type === 'chance') {
+    io.to(room.code).emit('notify', { type: 'rune' }); // звук руны
     drawCard(room, p, 'chance', diceSum);
   } else if (t.type === 'chest') {
     drawCard(room, p, 'chest', diceSum);
@@ -310,6 +316,7 @@ function moveTo(room, p, pos, awardGo = true) {
     p.money += 200;
     log(room, `💰 ${p.name} проходит СТАРТ: +200🪙.`);
   }
+  if (room.animFor === p.id) room.animPath.push(pos);
 }
 
 function drawCard(room, p, kind, diceSum) {
@@ -338,6 +345,7 @@ function applyCard(room, p, card, diceSum, deck, idx) {
     case 'moveBy': {
       let np = (p.pos + card.steps + 40) % 40;
       p.pos = np; // назад без бонуса СТАРТ
+      if (room.animFor === p.id) room.animPath.push(np);
       landOn(room, p, diceSum);
       return;
     }
@@ -461,6 +469,8 @@ function liquidateAuto(room, p) {
 
 // ---------- Действия игроков ----------
 function doRoll(room, p) {
+  room.animFor = p.id;   // фишка этого игрока пойдёт по пути
+  room.animPath = [];
   const d1 = 1 + Math.floor(Math.random() * 6);
   const d2 = 1 + Math.floor(Math.random() * 6);
   room.dice = [d1, d2];
