@@ -23,7 +23,13 @@ let lastDice = [0, 0];
 let clientNowAtState = Date.now(); // момент получения последнего состояния (для кулдауна похвал)
 let displayPos = {};               // отображаемая клетка фишки (для пошаговой анимации хода)
 let movingIds = new Set();         // игроки, чьи фишки сейчас шагают
+let moveDir = {};                  // направление шага (+1/-1) для плавного перемещения
 let hoppingIds = new Set();        // фишки, которым на этом шаге добавить «прыжок»
+let prevMoney = {};                // прошлый баланс игроков (для звука монет)
+let payShownFor = null;            // чтобы не дублировать звук окна оплаты
+let sfxVolume = parseInt(localStorage.getItem('monopoly_sfx_vol') || '70', 10) / 100; // громкость звуков
+let sfxMuted = localStorage.getItem('monopoly_sfx_muted') === '1';
+function sfxGain() { return sfxMuted ? 0 : sfxVolume; }
 
 // ---------- Доска: получаем статические данные с сервера через первый state ----------
 // Чтобы не дублировать board.js, отдадим её через отдельный fetch.
@@ -120,8 +126,15 @@ socket.on('state', (s) => {
   if (!YOU) YOU = socket.id;
   routeScreen();
   if (BOARD) { renderAll(); animateMoves(); }
-  // анимация кубиков
-  if (s.dice && (s.dice[0] !== prevDice[0] || s.dice[1] !== prevDice[1])) animateDice();
+  // анимация и звук кубиков
+  if (s.dice && (s.dice[0] !== prevDice[0] || s.dice[1] !== prevDice[1])) { animateDice(); playSnd('dice'); }
+  // звук изменения баланса (мой)
+  const meP = STATE.players && STATE.players.find(p => p.id === YOU);
+  if (meP) {
+    const prev = prevMoney[YOU];
+    if (prev !== undefined && meP.money !== prev) playSnd(meP.money > prev ? 'coinIn' : 'coinOut');
+  }
+  if (STATE.players) STATE.players.forEach(p => { prevMoney[p.id] = p.money; });
 });
 
 // ---------- Уведомления и звук похвалы (как commend в Dota 2) ----------
@@ -174,11 +187,14 @@ window.addEventListener('keydown', unlockAudio, { once: false });
 function playPraiseSound() {
   unlockAudio();
   if (!audioCtx) return;
+  const sv = sfxGain();
+  if (sv <= 0) return;
   const ctx = audioCtx;
   const t0 = ctx.currentTime;
 
   // один «удар» колокола: фундамент + колокольные обертоны, мягкая атака, долгий спад
   function bell(freq, start, gain, dur) {
+    gain = gain * sv;
     const partials = [
       { m: 1.0, g: 1.0 },
       { m: 2.0, g: 0.5 },
@@ -213,12 +229,109 @@ function playPraiseSound() {
   sp.frequency.setValueAtTime(2637, t0 + 0.085);   // E7
   sp.frequency.exponentialRampToValueAtTime(3520, t0 + 0.18); // A7
   sg.gain.setValueAtTime(0.0001, t0 + 0.085);
-  sg.gain.exponentialRampToValueAtTime(0.10, t0 + 0.11);
+  sg.gain.exponentialRampToValueAtTime(0.10 * sv, t0 + 0.11);
   sg.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.5);
   sp.connect(sg).connect(ctx.destination);
   sp.start(t0 + 0.085);
   sp.stop(t0 + 0.55);
 }
+
+// Короткие звуки хода (синтез, без файлов)
+function playSnd(name) {
+  unlockAudio();
+  if (!audioCtx) return;
+  const vol = sfxGain();
+  if (vol <= 0) return;
+  const ctx = audioCtx, t = ctx.currentTime;
+  const beep = (f1, f2, type, dur, gain, start) => {
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f1, t + start);
+    if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + start + dur);
+    g.gain.setValueAtTime(0.0001, t + start);
+    g.gain.exponentialRampToValueAtTime(gain * vol, t + start + 0.012);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + start + dur);
+    o.connect(g).connect(ctx.destination);
+    o.start(t + start); o.stop(t + start + dur + 0.03);
+  };
+  switch (name) {
+    case 'dice':    beep(220,140,'square',0.06,0.10,0); beep(260,160,'square',0.06,0.10,0.07); beep(200,120,'square',0.06,0.10,0.14); break;
+    case 'step':    beep(340,300,'sine',0.045,0.06,0); break;
+    case 'coinIn':  beep(659,988,'triangle',0.11,0.16,0); beep(988,1319,'triangle',0.11,0.14,0.08); break;
+    case 'coinOut': beep(440,330,'triangle',0.13,0.15,0); beep(294,220,'triangle',0.15,0.13,0.09); break;
+    case 'payAlert':beep(880,880,'sine',0.10,0.16,0); beep(660,660,'sine',0.14,0.16,0.12); break;
+  }
+}
+
+// ---------- Фоновая музыка ----------
+(function initMusic() {
+  const audio = document.getElementById('bg-music');
+  const slider = document.getElementById('music-volume');
+  const toggle = document.getElementById('music-toggle');
+  if (!audio || !slider || !toggle) return;
+
+  let vol = parseInt(localStorage.getItem('monopoly_music_vol') || '35', 10);
+  let muted = localStorage.getItem('monopoly_music_muted') === '1';
+  slider.value = vol;
+  audio.volume = vol / 100;
+
+  function refresh() {
+    audio.muted = muted || vol === 0;
+    toggle.textContent = audio.muted ? '🔇' : '🎵';
+    toggle.classList.toggle('off', audio.muted);
+  }
+  function tryPlay() { audio.play().catch(() => {}); }
+
+  slider.addEventListener('input', () => {
+    vol = parseInt(slider.value, 10);
+    audio.volume = vol / 100;
+    if (vol > 0) muted = false;
+    localStorage.setItem('monopoly_music_vol', String(vol));
+    localStorage.setItem('monopoly_music_muted', muted ? '1' : '0');
+    refresh();
+    tryPlay();
+  });
+  toggle.addEventListener('click', () => {
+    muted = !muted;
+    localStorage.setItem('monopoly_music_muted', muted ? '1' : '0');
+    refresh();
+    if (!muted) tryPlay();
+  });
+
+  // автозапуск по первому взаимодействию (политика автоплея)
+  const startOnce = () => { refresh(); tryPlay(); };
+  window.addEventListener('pointerdown', startOnce, { once: true });
+  window.addEventListener('keydown', startOnce, { once: true });
+  refresh();
+})();
+
+// ---------- Громкость звуков (похвала и игровые звуки) ----------
+(function initSfx() {
+  const slider = document.getElementById('sfx-volume');
+  const toggle = document.getElementById('sfx-toggle');
+  if (!slider || !toggle) return;
+  slider.value = Math.round(sfxVolume * 100);
+  function refresh() {
+    const off = sfxMuted || sfxVolume <= 0;
+    toggle.textContent = off ? '🔇' : '🔊';
+    toggle.classList.toggle('off', off);
+  }
+  slider.addEventListener('input', () => {
+    sfxVolume = parseInt(slider.value, 10) / 100;
+    if (sfxVolume > 0) sfxMuted = false;
+    localStorage.setItem('monopoly_sfx_vol', String(Math.round(sfxVolume * 100)));
+    localStorage.setItem('monopoly_sfx_muted', sfxMuted ? '1' : '0');
+    refresh();
+  });
+  slider.addEventListener('change', () => { if (sfxGain() > 0) playPraiseSound(); }); // пример — звук похвалы
+  toggle.addEventListener('click', () => {
+    sfxMuted = !sfxMuted;
+    localStorage.setItem('monopoly_sfx_muted', sfxMuted ? '1' : '0');
+    refresh();
+    if (!sfxMuted) playPraiseSound();
+  });
+  refresh();
+})();
 
 function routeScreen() {
   if (!STATE.started) {
@@ -277,19 +390,21 @@ function renderAll() {
   renderActions();
   renderLog();
   renderTrade();
+  renderPayPrompt();
 }
 
 const GRID = {}; // pos -> {row, col}
 function buildGrid() {
   // 11x11. pos0 правый-нижний угол.
-  GRID[0] = { r: 11, c: 11 };
-  for (let i = 1; i <= 9; i++) GRID[i] = { r: 11, c: 11 - i };   // нижний ряд
-  GRID[10] = { r: 11, c: 1 };
-  for (let i = 11; i <= 19; i++) GRID[i] = { r: 11 - (i - 10), c: 1 }; // левый столбец
-  GRID[20] = { r: 1, c: 1 };
-  for (let i = 21; i <= 29; i++) GRID[i] = { r: 1, c: (i - 20) + 1 };  // верхний ряд
-  GRID[30] = { r: 1, c: 11 };
-  for (let i = 31; i <= 39; i++) GRID[i] = { r: (i - 30) + 1, c: 11 }; // правый столбец
+  // СТАРТ — в левом верхнем углу, ход по часовой стрелке
+  GRID[0] = { r: 1, c: 1 };                                            // СТАРТ (верх-лево)
+  for (let i = 1; i <= 9; i++) GRID[i] = { r: 1, c: i + 1 };           // верхний ряд лево→право
+  GRID[10] = { r: 1, c: 11 };                                          // верх-право
+  for (let i = 11; i <= 19; i++) GRID[i] = { r: (i - 10) + 1, c: 11 }; // правый столбец сверху вниз
+  GRID[20] = { r: 11, c: 11 };                                         // низ-право
+  for (let i = 21; i <= 29; i++) GRID[i] = { r: 11, c: 11 - (i - 20) }; // нижний ряд право→лево
+  GRID[30] = { r: 11, c: 1 };                                          // низ-лево
+  for (let i = 31; i <= 39; i++) GRID[i] = { r: 11 - (i - 30), c: 1 }; // левый столбец снизу вверх
 }
 buildGrid();
 
@@ -303,6 +418,13 @@ function renderBoard() {
     const el = document.createElement('div');
     const isCorner = ['go', 'jail', 'parking', 'gotojail'].includes(t.type);
     el.className = 'tile' + (isCorner ? ' corner' : '');
+    // ориентация по стороне доски (плашка с цветом — по внешнему краю)
+    if (!isCorner) {
+      if (g.r === 11) el.classList.add('side-bottom');
+      else if (g.r === 1) el.classList.add('side-top');
+      else if (g.c === 1) el.classList.add('side-left');
+      else if (g.c === 11) el.classList.add('side-right');
+    }
     el.style.gridRow = g.r;
     el.style.gridColumn = g.c;
     el.dataset.pos = t.pos;
@@ -310,29 +432,27 @@ function renderBoard() {
     const o = STATE.ownership[t.pos];
     if (o && o.mortgaged) el.classList.add('mortgaged');
 
-    // цветная полоса для улиц / иконка для остальных
+    // плашка с цветом и ценой (цвет группы у улиц, нейтральный у прочих)
+    let stripBg = null;
+    if (t.type === 'street') stripBg = GROUPS[t.group].color;
+    else if (t.type === 'rail' || t.type === 'utility') stripBg = '#2a3350';
+    else if (t.type === 'tax') stripBg = '#3a2536';
+    let priceText = '';
+    if (t.type === 'tax') priceText = `−${t.amount}🪙`;
+    else if (o && o.mortgaged) priceText = 'залог';
+    else if (o) priceText = clientRentDisplay(t, o);
+    else if (t.price) priceText = `${t.price}🪙`;
+
     let inner = '';
-    if (t.type === 'street') {
-      const color = GROUPS[t.group].color;
-      // полоса сверху/сбоку в зависимости от стороны
-      inner += `<div class="colorbar" style="background:${color}"></div>`;
-    }
+    if (stripBg) inner += `<div class="strip" style="background:${stripBg}">${priceText}</div>`;
     inner += `<div class="body">`;
     inner += iconMarkup(t);
-    inner += `<div class="tname">${t.name}</div>`;
-    if (t.type === 'tax') {
-      inner += `<div class="tprice">−${t.amount}🪙</div>`;
-    } else if (o && o.mortgaged) {
-      inner += `<div class="tprice mort">залог</div>`;
-    } else if (o) {
-      inner += `<div class="tprice rent">${clientRentDisplay(t, o)}</div>`;
-    } else if (t.price) {
-      inner += `<div class="tprice">${t.price}🪙</div>`;
-    }
+    // имя показываем только у этих клеток (остальные — только картинка); скобки убираем, чтобы не обрезалось
+    if ([4, 10, 20, 30].indexOf(t.pos) !== -1) inner += `<div class="tname">${t.name.replace(/\s*\(.*?\)\s*/g, '')}</div>`;
     inner += `</div>`;
     el.innerHTML = inner;
 
-    // флаг владельца
+    // флаг владельца + рамка по периметру в цвет владельца
     if (o) {
       const owner = STATE.players.find(p => p.id === o.owner);
       if (owner) {
@@ -340,6 +460,9 @@ function renderBoard() {
         flag.className = 'owner-flag';
         flag.style.background = owner.color;
         el.appendChild(flag);
+        el.classList.add('owned');
+        el.style.boxShadow = `inset 0 0 0 3px ${owner.color}, 0 0 0 2px ${owner.color}, 0 0 9px 1px ${owner.color}`;
+        el.style.borderColor = owner.color;
       }
       // уровни застройки — звёздами над клеткой (добавим после цикла)
       if (t.type === 'street' && o.houses > 0) {
@@ -367,12 +490,15 @@ function renderBoard() {
   center.className = 'board-center';
   const cur = STATE.players[STATE.turnIndex];
   center.innerHTML = `
-    <div class="center-logo">DOTA 2<small>МОНОПОЛИЯ</small></div>
-    <div class="dice-area">
-      <div class="die" id="die1">${STATE.dice[0] || '?'}</div>
-      <div class="die" id="die2">${STATE.dice[1] || '?'}</div>
+    <div class="center-top">
+      <div class="turn-banner">${STATE.phase === 'over' ? '🏆 Игра окончена' : `Ход: ${cur ? cur.token + ' ' + cur.name : '—'}`}</div>
+      <div class="dice-area">
+        <div class="die" id="die1">${STATE.dice[0] || '?'}</div>
+        <div class="die" id="die2">${STATE.dice[1] || '?'}</div>
+      </div>
     </div>
-    <div class="turn-banner">${STATE.phase === 'over' ? '🏆 Игра окончена' : `Ход: ${cur ? cur.token + ' ' + cur.name : '—'}`}</div>
+    <div class="center-log-title">📜 Журнал</div>
+    <div id="log" class="log center-log"></div>
   `;
   board.appendChild(center);
 
@@ -424,8 +550,12 @@ function animateMoves() {
     const to = p.pos;
     if (displayPos[p.id] === undefined) { displayPos[p.id] = to; return; } // первый раз — без анимации
     if (displayPos[p.id] === to || movingIds.has(p.id)) return;
-    const gap = (to - displayPos[p.id] + 40) % 40;
-    if (gap === 0 || gap > 13) { displayPos[p.id] = to; placeTokens(); return; } // прыжок (карта/тюрьма) — без шагов
+    // смерть/тюрьма — мгновенно на респаун, без шагов
+    if (p.inJail && to === 10) { displayPos[p.id] = to; placeTokens(); return; }
+    // обычное перемещение — плавно, шагами по кратчайшему направлению
+    const forward = (to - displayPos[p.id] + 40) % 40;
+    const backward = 40 - forward;
+    moveDir[p.id] = forward <= backward ? 1 : -1;
     movingIds.add(p.id);
     walkStep(p.id);
   });
@@ -435,8 +565,11 @@ function walkStep(pid) {
   const player = STATE.players.find(x => x.id === pid);
   if (!player) { movingIds.delete(pid); return; }
   if (displayPos[pid] === player.pos) { movingIds.delete(pid); placeTokens(); return; }
-  displayPos[pid] = (displayPos[pid] + 1) % 40;
+  // если по дороге игрок попал в тюрьму — мгновенно на респаун
+  if (player.inJail && player.pos === 10) { displayPos[pid] = 10; movingIds.delete(pid); placeTokens(); return; }
+  displayPos[pid] = (displayPos[pid] + (moveDir[pid] || 1) + 40) % 40;
   hoppingIds.add(pid);
+  playSnd('step');
   placeTokens();
   setTimeout(() => hoppingIds.delete(pid), 180);
   setTimeout(() => walkStep(pid), 230);
@@ -487,6 +620,10 @@ function renderPlayers() {
       <div class="pmoney">${p.money}🪙</div>
       ${!p.connected ? '<div class="offline-overlay">Отключён</div>' : ''}
     `;
+    // клик по карточке — список героев игрока с ценами
+    card.style.cursor = 'pointer';
+    card.title = 'Показать недвижимость игрока';
+    card.onclick = () => openPlayerModal(p.id);
     // кнопка похвалы для других игроков
     if (me && !me.bankrupt && p.id !== YOU && !p.bankrupt) {
       const pb = document.createElement('button');
@@ -494,7 +631,7 @@ function renderPlayers() {
       pb.dataset.to = p.id;
       pb.textContent = '👍';
       pb.title = 'Похвалить игрока';
-      pb.onclick = () => act('praise', { to: p.id });
+      pb.onclick = (e) => { e.stopPropagation(); act('praise', { to: p.id }); };
       card.appendChild(pb);
     }
     panel.appendChild(card);
@@ -589,6 +726,14 @@ function renderActions() {
     buyBtn.disabled = me.money < t.price;
     row.appendChild(buyBtn);
     row.appendChild(btn('🔨 На аукцион', () => act('declineBuy')));
+    panel.appendChild(row);
+  } else if (STATE.phase === 'pay' && STATE.pendingPay) {
+    const pp = STATE.pendingPay;
+    const sub = document.createElement('div'); sub.className = 'action-sub';
+    sub.innerHTML = `Нужно заплатить аренду <b>${pp.amount}🪙</b> игроку <b>${pp.toName}</b> за «${pp.tileName}».`;
+    panel.appendChild(sub);
+    const row = document.createElement('div'); row.className = 'action-row';
+    row.appendChild(btn(`💸 Заплатить ${pp.amount}🪙`, () => act('payRent'), 'btn-primary'));
     panel.appendChild(row);
   } else if (STATE.phase === 'end') {
     const sub = document.createElement('div'); sub.className = 'action-sub';
@@ -805,6 +950,78 @@ function openTileModal(pos) {
   modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
 }
 function deedRow(l, v) { return `<div class="deed-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`; }
+
+// Список героев (недвижимости) игрока с ценами
+function openPlayerModal(pid) {
+  const p = STATE.players.find(x => x.id === pid);
+  if (!p) return;
+  const modal = $('player-modal');
+  const c = $('player-modal-content');
+  const owned = Object.keys(STATE.ownership).map(Number)
+    .filter(pos => STATE.ownership[pos].owner === pid)
+    .sort((a, b) => a - b);
+  let rows;
+  if (owned.length === 0) {
+    rows = '<div class="deed-desc">Пока нет недвижимости.</div>';
+  } else {
+    rows = owned.map(pos => {
+      const t = BOARD[pos];
+      const o = STATE.ownership[pos];
+      let stars = '';
+      if (t.type === 'street' && o.houses > 0) stars = o.houses === 5 ? ' 🌟' : ' ' + '⭐'.repeat(o.houses);
+      const bar = t.group ? GROUPS[t.group].color : '#7a849c';
+      const price = o.mortgaged
+        ? '<span style="color:var(--red)">залог</span>'
+        : `${t.price}🪙 · аренда ${clientRentDisplay(t, o)}`;
+      return `<div class="pm-row"><span class="pm-bar" style="background:${bar}"></span>${propThumb(t)}<span class="pm-name">${t.name}${stars}</span><span class="pm-price">${price}</span></div>`;
+    }).join('');
+  }
+  c.innerHTML = `
+    <div class="deed-head" style="background:${p.color}">
+      ${p.avatar ? `<img class="dh-photo" src="${p.avatar}" alt="" style="border-radius:50%">` : `<div class="dh-icon">${p.token}</div>`}
+      <div class="dh-name">${p.name}</div>
+      <div class="dh-group">💰 ${p.money}🪙 · 💼 капитал ${p.netWorth}🪙 · объектов: ${owned.length}</div>
+    </div>
+    <div class="deed-body pm-list">${rows}</div>
+    <div class="modal-actions"><button class="btn modal-close" style="width:100%">Закрыть</button></div>`;
+  modal.classList.remove('hidden');
+  c.querySelector('.modal-close').onclick = () => modal.classList.add('hidden');
+  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+}
+
+// Окно подтверждения оплаты аренды
+function renderPayPrompt() {
+  const modal = $('pay-modal');
+  if (!modal) return;
+  const pp = STATE.pendingPay;
+  const mine = STATE.phase === 'pay' && pp && STATE.currentPlayerId === YOU;
+  if (!mine) {
+    modal.classList.add('hidden');
+    if (!pp) payShownFor = null;
+    return;
+  }
+  const me = STATE.players.find(p => p.id === YOU);
+  const key = JSON.stringify(pp);
+  if (payShownFor !== key) { payShownFor = key; playSnd('payAlert'); }
+  const enough = me && me.money >= pp.amount;
+  const c = $('pay-modal-content');
+  c.innerHTML = `
+    <div class="deed-head" style="background:#5c2020">
+      <div class="dh-icon">💸</div>
+      <div class="dh-name">Оплата аренды</div>
+    </div>
+    <div class="deed-body">
+      <div class="deed-desc">Вы попали на «<b>${pp.tileName}</b>» игрока <b>${pp.toToken} ${pp.toName}</b>. Нужно заплатить аренду.</div>
+      ${deedRow('К оплате', '<b>' + pp.amount + '🪙</b>')}
+      ${deedRow('Ваш баланс', (me ? me.money : 0) + '🪙')}
+      ${enough ? '' : '<div class="deed-desc" style="color:var(--red)">Денег не хватает — при оплате активы будут проданы/заложены автоматически, а при нехватке наступит банкротство.</div>'}
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-primary" id="pay-confirm" style="width:100%">💸 Заплатить ${pp.amount}🪙 игроку ${pp.toName}</button>
+    </div>`;
+  modal.classList.remove('hidden');
+  $('pay-confirm').onclick = () => { act('payRent'); };
+}
 function tileTypeName(type) {
   return { go: 'Фонтан', jail: 'Респаун (ожидание)', parking: 'Лагерь крипов', gotojail: 'Гибель', chance: 'Руна', chest: 'Курьер' }[type] || type;
 }

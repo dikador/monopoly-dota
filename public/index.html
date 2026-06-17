@@ -53,15 +53,27 @@
     <aside class="sidebar">
       <div class="panel" id="players-panel"></div>
       <div class="panel" id="action-panel"></div>
-      <div class="panel log-panel">
-        <h3>Журнал</h3>
-        <div id="log" class="log"></div>
+      <div class="panel chat-panel">
+        <h3>Чат</h3>
         <div class="chat-row">
           <input id="chat-input" placeholder="Сообщение…" maxlength="200" />
           <button id="chat-btn" class="btn btn-sm">➤</button>
         </div>
       </div>
     </aside>
+  </div>
+
+  <!-- Фоновая музыка + регулятор громкости -->
+  <audio id="bg-music" src="/bg-music.mp3" loop preload="auto"></audio>
+  <div id="music-ctrl" class="music-ctrl">
+    <div class="mc-row">
+      <button id="music-toggle" class="music-btn" title="Музыка вкл/выкл">🎵</button>
+      <input id="music-volume" class="music-volume" type="range" min="0" max="100" value="35" title="Громкость музыки">
+    </div>
+    <div class="mc-row">
+      <button id="sfx-toggle" class="music-btn" title="Звуки вкл/выкл">🔊</button>
+      <input id="sfx-volume" class="music-volume" type="range" min="0" max="100" value="70" title="Громкость звуков">
+    </div>
   </div>
 
   <!-- Контейнер уведомлений (как commend в Dota 2) -->
@@ -74,6 +86,14 @@
   <!-- Модальное окно сделки -->
   <div id="trade-modal" class="modal hidden">
     <div class="modal-card" id="trade-modal-content"></div>
+  </div>
+  <!-- Модальное окно оплаты аренды -->
+  <div id="pay-modal" class="modal hidden">
+    <div class="modal-card" id="pay-modal-content"></div>
+  </div>
+  <!-- Модальное окно: герои игрока -->
+  <div id="player-modal" class="modal hidden">
+    <div class="modal-card" id="player-modal-content"></div>
   </div>
 
   <script src="/socket.io/socket.io.js"></script>

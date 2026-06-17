@@ -70,8 +70,9 @@ function newRoom(code) {
     turnIndex: 0,
     dice: [0, 0],
     doublesCount: 0,
-    phase: 'lobby', // lobby | roll | buy | auction | end | over
+    phase: 'lobby', // lobby | roll | buy | pay | auction | end | over
     pendingPos: null,
+    pendingPay: null,
     ownership: {}, // pos -> { owner, houses(0-5), mortgaged }
     chanceDeck: shuffle(CHANCE.map((_, i) => i)),
     chestDeck: shuffle(CHEST.map((_, i) => i)),
@@ -154,6 +155,7 @@ function publicState(room) {
     dice: room.dice,
     doublesCount: room.doublesCount,
     pendingPos: room.pendingPos,
+    pendingPay: room.pendingPay,
     ownership: room.ownership,
     auction: room.auction,
     trade: room.trade,
@@ -193,6 +195,7 @@ function activePlayers(room) { return room.players.filter(p => !p.bankrupt); }
 function nextTurn(room) {
   room.doublesCount = 0;
   room.pendingPos = null;
+  room.pendingPay = null;
   if (checkWin(room)) return;
   let i = room.turnIndex;
   for (let k = 0; k < room.players.length; k++) {
@@ -257,7 +260,7 @@ function landOn(room, p, diceSum) {
     } else {
       const owner = playerById(room, o.owner);
       const rent = calcRent(room, p.pos, diceSum);
-      payRentOrBankrupt(room, p, owner, rent, t);
+      setPendingPay(room, p, owner, rent, t);
     }
   } else if (t.type === 'tax') {
     log(room, `${p.token} ${p.name} платит ${t.name.toLowerCase()} ${t.amount}🪙.`);
@@ -275,10 +278,21 @@ function landOn(room, p, diceSum) {
 }
 
 function payRentOrBankrupt(room, p, owner, rent, t) {
-  log(room, `${p.token} ${p.name} платит аренду ${rent}🪙 игроку ${owner.name} за «${t.name}».`);
+  log(room, `${p.token} ${p.name} платит аренду ${rent}🪙 игроку ${owner ? owner.name : 'банку'} за «${t.name}».`);
   if (!pay(room, p, -rent, owner)) {
     startBankruptcy(room, p, owner, rent);
   }
+}
+
+// Поставить аренду на подтверждение игроком (фаза 'pay')
+function setPendingPay(room, p, owner, rent, t) {
+  room.pendingPay = {
+    amount: rent,
+    toId: owner.id, toName: owner.name, toToken: owner.token,
+    pos: t.pos, tileName: t.name,
+  };
+  room.phase = 'pay';
+  log(room, `${p.token} ${p.name} должен аренду ${rent}🪙 игроку ${owner.token} ${owner.name} за «${t.name}» — ждём оплату.`);
 }
 
 function passGoIfNeeded(room, p, oldPos) {
@@ -381,7 +395,7 @@ function applyCard(room, p, card, diceSum, deck, idx) {
       } else {
         const owner = playerById(room, o.owner);
         const rent = calcRent(room, target, diceSum) * 2; // двойная аренда
-        payRentOrBankrupt(room, p, owner, rent, t);
+        setPendingPay(room, p, owner, rent, t);
       }
       return;
     }
@@ -745,6 +759,17 @@ function handleAction(room, sid, msg) {
       if (!isCurrent || room.phase !== 'buy') return;
       startAuction(room, room.pendingPos);
       return;
+
+    case 'payRent': {
+      if (!isCurrent || room.phase !== 'pay' || !room.pendingPay) return;
+      const pp = room.pendingPay;
+      const owner = pp.toId ? playerById(room, pp.toId) : null;
+      room.pendingPay = null;
+      payRentOrBankrupt(room, p, owner, pp.amount, { name: pp.tileName });
+      if (p.bankrupt) nextTurn(room);
+      else room.phase = canRollAgain(room, p) ? 'roll' : 'end';
+      return;
+    }
 
     case 'auctionBid':
       if (room.phase !== 'auction' || !room.auction) return;
