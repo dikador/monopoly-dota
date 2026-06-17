@@ -149,8 +149,21 @@ socket.on('notify', (n) => {
       highlight: mine,
     });
     playPraiseSound();
+  } else if (n.type === 'buyback') {
+    playBuyback();
   }
 });
+
+// Звук выкупа (mp3) — с учётом громкости звуков
+let buybackAudio = null;
+function playBuyback() {
+  const v = sfxGain();
+  if (v <= 0) return;
+  if (!buybackAudio) buybackAudio = new Audio('/buyback.mp3');
+  buybackAudio.volume = v;
+  buybackAudio.currentTime = 0;
+  buybackAudio.play().catch(() => {});
+}
 
 function showToast({ icon, title, text, sub, highlight }) {
   const wrap = $('toasts');

@@ -264,6 +264,7 @@ function landOn(room, p, diceSum) {
     }
   } else if (t.type === 'tax') {
     log(room, `${p.token} ${p.name} платит ${t.name.toLowerCase()} ${t.amount}🪙.`);
+    if (p.pos === 4) io.to(room.code).emit('notify', { type: 'buyback' }); // звук выкупа
     if (!pay(room, p, -t.amount)) startBankruptcy(room, p, null, t.amount);
   } else if (t.type === 'gotojail') {
     sendToJail(room, p);
