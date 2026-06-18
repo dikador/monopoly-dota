@@ -220,6 +220,13 @@ function nextTurn(room) {
   log(room, `▶️ Ход игрока ${p.token} ${p.name}.`);
 }
 
+// Автозавершение хода: при дубле — повторный бросок, иначе передаём ход
+function autoEndTurn(room) {
+  const p = currentPlayer(room);
+  if (p && canRollAgain(room, p)) room.phase = 'roll';
+  else nextTurn(room);
+}
+
 function checkWin(room) {
   const alive = activePlayers(room);
   if (room.started && alive.length === 1) {
@@ -607,6 +614,7 @@ io.on('connection', (socket) => {
     const room = getRoom(joinedCode);
     if (!room || !room.started) return;
     handleAction(room, socket.id, msg);
+    if (room.phase === 'end') autoEndTurn(room); // ход завершается автоматически
     broadcast(room);
   });
 

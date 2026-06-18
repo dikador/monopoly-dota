@@ -26,6 +26,11 @@ let movingIds = new Set();         // игроки, чьи фишки сейча
 let moveDir = {};                  // направление шага (+1/-1) для плавного перемещения
 let moveQueue = {};                // очередь клеток-целей для пошагового прохода по пути
 let animWatchdog = null;           // страховочный таймер разблокировки
+let pendingSounds = [];            // звуки событий, отложенные до прихода фишки
+
+// Звук события: пока фишка идёт — откладываем, иначе играем сразу
+function eventSound(fn) { if (turnAnimating) pendingSounds.push(fn); else fn(); }
+function flushPendingSounds() { const list = pendingSounds; pendingSounds = []; list.forEach(fn => { try { fn(); } catch (e) {} }); }
 let hoppingIds = new Set();        // фишки, которым на этом шаге добавить «прыжок»
 let prevMoney = {};                // прошлый баланс игроков (для звука монет)
 let prevOwnedCount = null;         // число купленных клеток (для звука покупки)
@@ -141,20 +146,20 @@ socket.on('state', (s) => {
   // оплата аренды завершилась? (pendingPay был и пропал)
   let rentEvent = false;
   if (prevPay && !STATE.pendingPay && (YOU === prevPay.toId || YOU === prevPay.fromId)) rentEvent = true;
-  // звук изменения баланса (мой): аренда — отдельным звуком монет
+  // звук изменения баланса (мой): аренда — отдельным звуком монет (откладываем, пока фишка идёт)
   const meP = STATE.players && STATE.players.find(p => p.id === YOU);
   if (meP) {
     const prev = prevMoney[YOU];
     if (prev !== undefined && meP.money !== prev) {
-      if (rentEvent) playClip('coins');
-      else playSnd(meP.money > prev ? 'coinIn' : 'coinOut');
+      if (rentEvent) eventSound(() => playClip('coins'));
+      else eventSound(() => playSnd(meP.money > prev ? 'coinIn' : 'coinOut'));
     }
   }
   if (STATE.players) STATE.players.forEach(p => { prevMoney[p.id] = p.money; });
   prevPay = STATE.pendingPay ? { toId: STATE.pendingPay.toId, fromId: STATE.currentPlayerId } : null;
   // звук покупки — когда появился новый владелец (покупка/аукцион)
   const ownedCount = Object.keys(STATE.ownership || {}).length;
-  if (prevOwnedCount !== null && ownedCount > prevOwnedCount) playClip('buy');
+  if (prevOwnedCount !== null && ownedCount > prevOwnedCount) eventSound(() => playClip('buy'));
   prevOwnedCount = ownedCount;
 });
 
@@ -171,9 +176,9 @@ socket.on('notify', (n) => {
     });
     playPraiseSound();
   } else if (n.type === 'buyback') {
-    playClip('buyback');
+    pendingSounds.push(() => playClip('buyback')); // прозвучит, когда фишка дойдёт
   } else if (n.type === 'rune') {
-    playClip('rune');
+    pendingSounds.push(() => playClip('rune'));
   }
 });
 
@@ -488,7 +493,7 @@ function renderBoard() {
     inner += `<div class="body">`;
     inner += iconMarkup(t);
     // имя показываем только у этих клеток (остальные — только картинка); скобки убираем, чтобы не обрезалось
-    if ([4, 10, 20, 30].indexOf(t.pos) !== -1) inner += `<div class="tname">${t.name.replace(/\s*\(.*?\)\s*/g, '')}</div>`;
+    if ([4, 10, 30].indexOf(t.pos) !== -1) inner += `<div class="tname">${t.name.replace(/\s*\(.*?\)\s*/g, '')}</div>`;
     inner += `</div>`;
     el.innerHTML = inner;
 
@@ -619,6 +624,7 @@ function finishTurnAnim() {
   clearTimeout(animWatchdog);
   if (!turnAnimating) return;
   turnAnimating = false;
+  flushPendingSounds(); // фишка дошла — проигрываем отложенные звуки событий
   if (STATE && STATE.started) { renderActions(); renderPayPrompt(); }
 }
 
@@ -631,6 +637,7 @@ function armAnimWatchdog() {
     if (STATE && STATE.players) STATE.players.forEach(p => { displayPos[p.id] = p.pos; });
     placeTokens();
     turnAnimating = false;
+    flushPendingSounds();
     if (STATE && STATE.started) { renderActions(); renderPayPrompt(); }
   }, 12000);
 }
@@ -835,6 +842,9 @@ function renderActions() {
       if (me.getOutCards > 0) row.appendChild(btn('🎟️ Карта выхода', () => act('useJailCard')));
       panel.appendChild(row);
     } else {
+      const sub = document.createElement('div'); sub.className = 'action-sub';
+      sub.textContent = 'До броска можно строить, закладывать и торговать. После броска ход завершится автоматически.';
+      panel.appendChild(sub);
       const row = document.createElement('div'); row.className = 'action-row';
       const again = STATE.doublesCount > 0;
       row.appendChild(btn(again ? '🎲 Бросить ещё раз (дубль!)' : '🎲 Бросить кубики', () => act('roll'), 'btn-primary'));
@@ -858,13 +868,6 @@ function renderActions() {
     panel.appendChild(sub);
     const row = document.createElement('div'); row.className = 'action-row';
     row.appendChild(btn(`💸 Заплатить ${pp.amount}🪙`, () => act('payRent'), 'btn-primary'));
-    panel.appendChild(row);
-  } else if (STATE.phase === 'end') {
-    const sub = document.createElement('div'); sub.className = 'action-sub';
-    sub.textContent = 'Стройте, закладывайте, торгуйте — затем завершите ход.';
-    panel.appendChild(sub);
-    const row = document.createElement('div'); row.className = 'action-row';
-    row.appendChild(btn('✅ Завершить ход', () => act('endTurn'), 'btn-primary'));
     panel.appendChild(row);
   }
 
