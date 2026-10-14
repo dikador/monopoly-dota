@@ -37,6 +37,7 @@ let prevOwnedCount = null;         // число купленных клеток
 let turnAnimating = false;         // фишка ещё идёт — прячем оповещения/кнопки хода
 let prevPay = null;                // незакрытая оплата аренды из прошлого состояния (для звука монет)
 let payShownFor = null;            // чтобы не дублировать звук окна оплаты
+let payModalHidden = false;        // окно оплаты свёрнуто, пока игрок предлагает сделку
 let sfxVolume = parseInt(localStorage.getItem('monopoly_sfx_vol') || '70', 10) / 100; // громкость звуков
 let sfxMuted = localStorage.getItem('monopoly_sfx_muted') === '1';
 function sfxGain() { return sfxMuted ? 0 : sfxVolume; }
@@ -179,6 +180,14 @@ socket.on('notify', (n) => {
     pendingSounds.push(() => playClip('buyback')); // прозвучит, когда фишка дойдёт
   } else if (n.type === 'rune') {
     pendingSounds.push(() => playClip('rune'));
+  } else if (n.type === 'death') {
+    // звук и окно смерти — когда фишка дойдёт до клетки
+    pendingSounds.push(() => {
+      playClip('death');
+      const text = `${n.reason ? n.reason + ' ' : ''}Отправляйтесь на Респаун: бросьте дубль, заплатите 50🪙 или используйте свиток Aegis.`;
+      if (n.byId === YOU) showEventModal({ icon: '💀', title: 'Вы убиты!', text, color: '#5c2020' });
+      else showToast({ icon: '💀', title: `${n.byName} убит!`, text: n.reason || 'Отправляется на Респаун.', highlight: false });
+    });
   } else if (n.type === 'card') {
     // попап с текстом карты — когда фишка дойдёт до клетки
     pendingSounds.push(() => {
@@ -195,14 +204,19 @@ socket.on('notify', (n) => {
 
 let cardModalTimer = null;
 function showCardModal(kind, text) {
+  const isRune = kind === 'chance';
+  showEventModal({ icon: isRune ? '🔮' : '📦', title: isRune ? 'Руна' : 'Курьер', text, color: isRune ? '#2a3f5c' : '#5c3f2a' });
+}
+
+// Общее всплывающее окно события (карта, смерть и т.п.)
+function showEventModal({ icon, title, text, color }) {
   const modal = $('card-modal');
   const c = $('card-modal-content');
   if (!modal || !c) return;
-  const isRune = kind === 'chance';
   c.innerHTML = `
-    <div class="deed-head" style="background:${isRune ? '#2a3f5c' : '#5c3f2a'}">
-      <div class="dh-icon">${isRune ? '🔮' : '📦'}</div>
-      <div class="dh-name">${isRune ? 'Руна' : 'Курьер'}</div>
+    <div class="deed-head" style="background:${color}">
+      <div class="dh-icon">${icon}</div>
+      <div class="dh-name">${title}</div>
     </div>
     <div class="deed-body"><div class="deed-desc" style="font-size:16px; line-height:1.5">${text}</div></div>
     <div class="modal-actions"><button class="btn btn-primary card-close" style="width:100%">Ок</button></div>`;
@@ -223,7 +237,8 @@ function playClip(name) {
   const a = clipCache[name];
   a.volume = v;
   a.currentTime = 0;
-  a.play().catch(() => {});
+  // если файла нет — для смерти играем синтезированную замену
+  a.play().catch(() => { if (name === 'death') playSnd('death'); });
 }
 
 function showToast({ icon, title, text, sub, highlight }) {
@@ -337,6 +352,7 @@ function playSnd(name) {
     case 'coinIn':  beep(659,988,'triangle',0.11,0.16,0); beep(988,1319,'triangle',0.11,0.14,0.08); break;
     case 'coinOut': beep(440,330,'triangle',0.13,0.15,0); beep(294,220,'triangle',0.15,0.13,0.09); break;
     case 'payAlert':beep(880,880,'sine',0.10,0.16,0); beep(660,660,'sine',0.14,0.16,0.12); break;
+    case 'death':   beep(392,196,'sawtooth',0.35,0.14,0); beep(294,147,'sawtooth',0.45,0.13,0.25); beep(196,82,'triangle',0.9,0.18,0.55); break;
   }
 }
 
@@ -540,6 +556,15 @@ function renderBoard() {
         el.classList.add('owned');
         el.style.boxShadow = `inset 0 0 0 3px ${owner.color}, 0 0 0 2px ${owner.color}, 0 0 9px 1px ${owner.color}`;
         el.style.borderColor = owner.color;
+      }
+      // таймер залога прямо на иконке героя
+      if (o.mortgaged) {
+        const left = mortgageLeft(o);
+        const mt = document.createElement('div');
+        mt.className = 'mort-timer' + (left <= 3 ? ' low' : '');
+        mt.textContent = `⏳ ${left}`;
+        mt.title = `Залог: клетка освободится через ${left} ход(ов) владельца, если не выкупить`;
+        el.appendChild(mt);
       }
       // уровни застройки — звёздами над клеткой (добавим после цикла)
       if (t.type === 'street' && o.houses > 0) {
@@ -856,8 +881,11 @@ function renderActions() {
     const payBtn = btn(`💸 Заплатить ${need}🪙`, () => act('payDebt'), 'btn-primary');
     payBtn.disabled = !enough;
     row.appendChild(payBtn);
-    row.appendChild(btn('💥 Банкротство', () => { if (confirm('Объявить себя банкротом? Всё имущество перейдёт кредитору/банку.')) act('declareBankruptcy'); }));
+    row.appendChild(btn('💥 Банкротство', () => { if (confirm('Объявить себя банкротом? Ваши клетки станут свободными.')) act('declareBankruptcy'); }));
     panel.appendChild(row);
+    const trow = document.createElement('div'); trow.className = 'action-row';
+    trow.appendChild(btn('🤝 Предложить сделку', openTradeModal));
+    panel.appendChild(trow);
     renderPropertyManager(panel, me, true);
     return;
   }
@@ -896,10 +924,13 @@ function renderActions() {
   } else if (STATE.phase === 'pay' && STATE.pendingPay) {
     const pp = STATE.pendingPay;
     const sub = document.createElement('div'); sub.className = 'action-sub';
-    sub.innerHTML = `Нужно заплатить аренду <b>${pp.amount}🪙</b> игроку <b>${pp.toName}</b> за «${pp.tileName}».`;
+    sub.innerHTML = pp.toId
+      ? `Нужно заплатить аренду <b>${pp.amount}🪙</b> игроку <b>${pp.toName}</b> за «${pp.tileName}».`
+      : `Нужно заплатить «${pp.tileName}» — <b>${pp.amount}🪙</b> банку.`;
     panel.appendChild(sub);
     const row = document.createElement('div'); row.className = 'action-row';
     row.appendChild(btn(`💸 Заплатить ${pp.amount}🪙`, () => act('payRent'), 'btn-primary'));
+    row.appendChild(btn('🤝 Предложить сделку', openTradeModal));
     panel.appendChild(row);
   }
 
@@ -925,18 +956,26 @@ function renderAuction(panel, me) {
   const myAuctionTurn = turnPlayer && turnPlayer.id === YOU && a.active.includes(YOU);
   panel.innerHTML = `<div class="action-title">🔨 Аукцион</div>`;
   const sub = document.createElement('div'); sub.className = 'action-sub';
-  const highName = a.highBidder ? STATE.players.find(p => p.id === a.highBidder).name : '—';
-  sub.innerHTML = `«<b>${t.name}</b>»<br>Текущая ставка: <b>${a.highBid}🪙</b> (${highName})<br>Сейчас ставит: <b>${turnPlayer ? turnPlayer.name : ''}</b>`;
+  const highBidder = a.highBidder ? STATE.players.find(p => p.id === a.highBidder) : null;
+  // минимальная ставка: без ставок — цена клетки, дальше — на 1 выше текущей
+  const minBid = highBidder ? a.highBid + 1 : (a.minBid || 0);
+  sub.innerHTML = `«<b>${t.name}</b>»<br>` +
+    (highBidder
+      ? `Текущая ставка: <b>${a.highBid}🪙</b> (${highBidder.name})`
+      : `Стартовая цена: <b>${a.minBid || 0}🪙</b> (ставок ещё нет)`) +
+    `<br>Сейчас ставит: <b>${turnPlayer ? turnPlayer.name : ''}</b>`;
   panel.appendChild(sub);
 
   if (myAuctionTurn) {
     const inp = document.createElement('input');
-    inp.type = 'number'; inp.min = a.highBid + 1; inp.value = a.highBid + 10;
+    inp.type = 'number'; inp.min = minBid;
+    inp.value = highBidder ? a.highBid + 10 : minBid;
     inp.style.margin = '8px 0';
     panel.appendChild(inp);
     const row = document.createElement('div'); row.className = 'action-row';
     const bid = btn('Сделать ставку', () => act('auctionBid', { amount: Number(inp.value) }), 'btn-primary');
-    bid.disabled = me.money <= a.highBid;
+    bid.disabled = me.money < minBid;
+    inp.oninput = () => { const v = Number(inp.value) || 0; bid.disabled = v < minBid || v > me.money; };
     row.appendChild(bid);
     row.appendChild(btn('Пас', () => act('auctionPass')));
     panel.appendChild(row);
@@ -993,10 +1032,10 @@ function renderPropertyManager(panel, me, isMyTurn) {
 }
 
 // Остаток ходов до освобождения заложенной клетки
+// Остаток ходов владельца до освобождения заложенной клетки
 function mortgageLeft(o) {
-  const lim = STATE.mortgageTurns || 15;
-  const left = lim - ((STATE.turnCount || 0) - (o.mortgagedTurn || 0));
-  return Math.max(0, left);
+  if (o.mortgageLeft != null) return Math.max(0, o.mortgageLeft);
+  return STATE.mortgageTurns || 15;
 }
 
 function ownsFullGroupClient(group) {
@@ -1098,7 +1137,7 @@ function openTileModal(pos) {
   if (o) {
     const owner = STATE.players.find(p => p.id === o.owner);
     rows = deedRow('Владелец', owner ? owner.token + ' ' + owner.name : '—') + rows;
-    if (o.mortgaged) rows = deedRow('Статус', '🏦 Заложено') + rows;
+    if (o.mortgaged) rows = deedRow('Статус', `🏦 Заложено · ⏳ ${mortgageLeft(o)} ход(ов) владельца`) + rows;
   } else if (t.price) {
     rows = deedRow('Владелец', 'Свободно') + rows;
   }
@@ -1137,6 +1176,13 @@ function openTileModal(pos) {
         ${t.group ? `<div class="dh-group">${GROUPS[t.group].name}</div>` : ''}
       </div>
       <div class="deed-body">
+        ${o && o.mortgaged ? (() => {
+          const left = mortgageLeft(o);
+          return `<div class="mort-box${left <= 3 ? ' low' : ''}">
+            <div class="mort-box-num">⏳ ${left}</div>
+            <div class="mort-box-text"><b>Заложено.</b> Клетка освободится через <b>${left}</b> ход(ов) ${o.owner === YOU ? 'ваших' : 'владельца'} (таймер идёт только в его ходы), если её не выкупить${o.owner === YOU ? ` — выкуп ${Math.ceil(t.price / 2 * 1.1)}🪙` : ''}.</div>
+          </div>`;
+        })() : ''}
         ${desc ? `<div class="deed-desc">${desc}</div>` : ''}
         ${rows}
         ${hint ? `<div class="action-sub" style="margin-top:8px">${hint}</div>` : ''}
@@ -1188,9 +1234,14 @@ function openPlayerModal(pid) {
       <div class="dh-group">💰 ${p.money}🪙 · 💼 капитал ${p.netWorth}🪙 · объектов: ${owned.length}</div>
     </div>
     <div class="deed-body pm-list">${rows}</div>
-    <div class="modal-actions"><button class="btn modal-close" style="width:100%">Закрыть</button></div>`;
+    <div class="modal-actions" style="flex-wrap:wrap; gap:8px">
+      ${pid !== YOU && !p.bankrupt ? '<button class="btn btn-primary pm-trade" style="width:100%">🤝 Предложить обмен</button>' : ''}
+      <button class="btn modal-close" style="width:100%">Закрыть</button>
+    </div>`;
   modal.classList.remove('hidden');
   c.querySelector('.modal-close').onclick = () => modal.classList.add('hidden');
+  const tb = c.querySelector('.pm-trade');
+  if (tb) tb.onclick = () => { modal.classList.add('hidden'); openTradeModal(pid); };
   modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
 }
 
@@ -1208,25 +1259,31 @@ function renderPayPrompt() {
   }
   const me = STATE.players.find(p => p.id === YOU);
   const key = JSON.stringify(pp);
-  if (payShownFor !== key) { payShownFor = key; playSnd('payAlert'); }
+  if (payShownFor !== key) { payShownFor = key; payModalHidden = false; playSnd('payAlert'); }
+  if (payModalHidden) { modal.classList.add('hidden'); return; } // свернули ради сделки
   const enough = me && me.money >= pp.amount;
+  const isTax = !pp.toId;
   const c = $('pay-modal-content');
   c.innerHTML = `
     <div class="deed-head" style="background:#5c2020">
       <div class="dh-icon">💸</div>
-      <div class="dh-name">Оплата аренды</div>
+      <div class="dh-name">${isTax ? 'Оплата налога' : 'Оплата аренды'}</div>
     </div>
     <div class="deed-body">
-      <div class="deed-desc">Вы попали на «<b>${pp.tileName}</b>» игрока <b>${pp.toToken} ${pp.toName}</b>. Нужно заплатить аренду.</div>
+      <div class="deed-desc">${isTax
+        ? `Вы попали на «<b>${pp.tileName}</b>». Нужно заплатить банку.`
+        : `Вы попали на «<b>${pp.tileName}</b>» игрока <b>${pp.toToken} ${pp.toName}</b>. Нужно заплатить аренду.`}</div>
       ${deedRow('К оплате', '<b>' + pp.amount + '🪙</b>')}
       ${deedRow('Ваш баланс', (me ? me.money : 0) + '🪙')}
-      ${enough ? '' : '<div class="deed-desc" style="color:var(--red)">Денег не хватает — при оплате активы будут проданы/заложены автоматически, а при нехватке наступит банкротство.</div>'}
+      ${enough ? '' : '<div class="deed-desc" style="color:var(--red)">Денег не хватает — можно сначала предложить сделку, а при оплате откроется режим долга (продать/заложить или банкротство).</div>'}
     </div>
-    <div class="modal-actions">
-      <button class="btn btn-primary" id="pay-confirm" style="width:100%">💸 Заплатить ${pp.amount}🪙 игроку ${pp.toName}</button>
+    <div class="modal-actions" style="flex-wrap:wrap; gap:8px">
+      <button class="btn btn-primary" id="pay-confirm" style="width:100%">💸 Заплатить ${pp.amount}🪙 ${isTax ? 'банку' : 'игроку ' + pp.toName}</button>
+      <button class="btn" id="pay-trade" style="width:100%">🤝 Сначала предложить сделку</button>
     </div>`;
   modal.classList.remove('hidden');
   $('pay-confirm').onclick = () => { act('payRent'); };
+  $('pay-trade').onclick = () => { payModalHidden = true; modal.classList.add('hidden'); openTradeModal(); };
 }
 function tileTypeName(type) {
   return { go: 'Фонтан', jail: 'Респаун (ожидание)', parking: 'Лагерь крипов', gotojail: 'Гибель', chance: 'Руна', chest: 'Курьер' }[type] || type;
@@ -1236,7 +1293,7 @@ function tileTypeName(type) {
 function tileDescription(t) {
   switch (t.type) {
     case 'go':
-      return '🌀 <b>Фонтан</b> — точка возрождения вашей команды. Каждый раз, проходя или попадая сюда, вы получаете <b>200🪙</b> золота за круг.';
+      return '🌀 <b>Фонтан</b> — точка возрождения вашей команды. Каждый раз, проходя или попадая сюда, вы получаете <b>200🪙</b> золота за круг, а если остановиться ровно на Фонтане — ещё <b>+100🪙</b> бонусом.';
     case 'jail':
       return '⏳ <b>Респаун.</b> Если вы здесь проездом — просто отдыхаете, ничего не теряете. Если вас сюда отправили после гибели — вы ждёте возрождения: бросьте дубль, заплатите <b>50🪙</b> за выкуп или используйте <b>свиток Aegis</b>, чтобы вернуться в бой.';
     case 'parking':
@@ -1263,69 +1320,106 @@ function tileDescription(t) {
 }
 
 // ---------- Сделки ----------
-function openTradeModal() {
+// Карточка клетки в окне обмена (как строки в списке героев игрока)
+function tradeItemHtml(pos, selectable) {
+  const t = BOARD[pos];
+  const o = STATE.ownership[pos];
+  const bar = t.group ? GROUPS[t.group].color : '#7a849c';
+  const tag = o && o.mortgaged ? '<span style="color:var(--red)">залог</span>' : `${t.price}🪙`;
+  return `<div class="pm-row trade-item${selectable ? '' : ' ro'}" data-pos="${pos}"><span class="pm-bar" style="background:${bar}"></span>${propThumb(t)}<span class="pm-name">${t.name}</span><span class="pm-price">${tag}</span></div>`;
+}
+function tradeAvatar(p) {
+  return p.avatar ? `<img class="wp-av" src="${p.avatar}" style="border-color:${p.color}" alt="">` : `<span>${p.token}</span>`;
+}
+
+// Окно обмена. presetId — с кем сразу открыть обмен (необязательно)
+function openTradeModal(presetId) {
   const me = STATE.players.find(p => p.id === YOU);
   const others = STATE.players.filter(p => p.id !== YOU && !p.bankrupt);
-  if (others.length === 0) return;
+  if (!me || others.length === 0) return;
   const modal = $('trade-modal');
   const c = $('trade-modal-content');
+  c.classList.add('trade-card');
 
-  const myProps = Object.keys(STATE.ownership).map(Number).filter(pos => STATE.ownership[pos].owner === YOU && STATE.ownership[pos].houses === 0);
+  let target = (typeof presetId === 'string' && others.some(p => p.id === presetId)) ? presetId : others[0].id;
+  const offer = new Set();
+  const req = new Set();
+  const tradable = id => Object.keys(STATE.ownership).map(Number)
+    .filter(pos => STATE.ownership[pos].owner === id && STATE.ownership[pos].houses === 0)
+    .sort((a, b) => a - b);
+  const partner = () => others.find(p => p.id === target);
+  const om = () => Math.max(0, Math.floor(Number($('offer-money').value) || 0));
+  const rm = () => Math.max(0, Math.floor(Number($('req-money').value) || 0));
 
-  const targetOptions = others.map(p => `<option value="${p.id}">${p.token} ${p.name}</option>`).join('');
+  function update() {
+    const tp = partner();
+    const empty = !(om() > 0 || rm() > 0 || offer.size || req.size);
+    let warn = '';
+    if (om() > me.money) warn = 'У вас нет столько денег.';
+    else if (rm() > tp.money) warn = `У ${tp.name} нет столько денег.`;
+    else if (empty) warn = 'Выберите, что отдаёте или что хотите получить.';
+    $('trade-summary').innerHTML =
+      `<b>Вы отдаёте:</b> ${describeTrade([...offer], om()) || 'ничего'}<br>` +
+      `<b>Вы получаете:</b> ${describeTrade([...req], rm()) || 'ничего'}` +
+      (warn ? `<div class="trade-warn">${warn}</div>` : '');
+    $('send-trade').disabled = !!warn;
+  }
 
-  c.innerHTML = `
-    <div class="deed-head" style="background:#2a2f47"><div class="dh-name">🤝 Сделка</div></div>
-    <div class="trade-grid">
-      <div>
-        <h4>Кому</h4>
-        <select id="trade-target" style="width:100%;padding:10px;border-radius:8px;background:var(--bg2);color:var(--ink);border:1px solid var(--line)">${targetOptions}</select>
-      </div>
-      <div>
-        <h4>Вы отдаёте</h4>
-        <label>Деньги (🪙)</label>
-        <input id="offer-money" type="number" min="0" value="0" max="${me.money}">
-        <div class="trade-props" id="offer-props">${myProps.map(pos => propCheck('offer', pos)).join('') || '<span class="action-sub">нет активов без домов</span>'}</div>
-      </div>
-      <div>
-        <h4>Вы получаете</h4>
-        <label>Деньги (🪙)</label>
-        <input id="req-money" type="number" min="0" value="0">
-        <div class="trade-props" id="req-props"></div>
-      </div>
-      <div class="action-row">
-        <button class="btn btn-primary" id="send-trade">Отправить предложение</button>
-        <button class="btn" id="close-trade">Отмена</button>
-      </div>
-    </div>`;
-  modal.classList.remove('hidden');
+  function render() {
+    const tp = partner();
+    req.clear(); // запрос сбрасываем при смене партнёра, своё предложение сохраняем
+    const mine = tradable(YOU);
+    const theirs = tradable(target);
+    const none = '<span class="action-sub">Нет клеток без домов</span>';
+    c.innerHTML = `
+      <div class="deed-head" style="background:#2a2f47"><div class="dh-name">🤝 Обмен</div></div>
+      <div class="trade-body">
+        <div class="trade-partners">${others.map(p =>
+          `<div class="wp-chip trade-partner${p.id === target ? ' sel' : ''}" data-id="${p.id}">${tradeAvatar(p)} ${p.name} · ${p.money}🪙</div>`).join('')}</div>
+        <div class="trade-cols">
+          <div class="trade-col">
+            <h4>${tradeAvatar(me)} Вы отдаёте</h4>
+            <div class="trade-money"><input id="offer-money" type="number" min="0" max="${me.money}" value="0" placeholder="0"><span class="action-sub">из ${me.money}🪙</span></div>
+            <div class="trade-list" id="offer-props">${mine.map(pos => tradeItemHtml(pos, true)).join('') || none}</div>
+          </div>
+          <div class="trade-col">
+            <h4>${tradeAvatar(tp)} Вы получаете</h4>
+            <div class="trade-money"><input id="req-money" type="number" min="0" max="${tp.money}" value="0" placeholder="0"><span class="action-sub">из ${tp.money}🪙</span></div>
+            <div class="trade-list" id="req-props">${theirs.map(pos => tradeItemHtml(pos, true)).join('') || none}</div>
+          </div>
+        </div>
+        <div class="trade-summary" id="trade-summary"></div>
+        <div class="action-row">
+          <button class="btn btn-primary" id="send-trade">Отправить предложение</button>
+          <button class="btn" id="close-trade">Отмена</button>
+        </div>
+      </div>`;
 
-  const fillReq = () => {
-    const tid = $('trade-target').value;
-    const theirProps = Object.keys(STATE.ownership).map(Number).filter(pos => STATE.ownership[pos].owner === tid && STATE.ownership[pos].houses === 0);
-    $('req-props').innerHTML = theirProps.map(pos => propCheck('req', pos)).join('') || '<span class="action-sub">нет активов без домов</span>';
-  };
-  fillReq();
-  $('trade-target').onchange = fillReq;
-
-  $('close-trade').onclick = () => modal.classList.add('hidden');
-  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
-  $('send-trade').onclick = () => {
-    const to = $('trade-target').value;
-    const offerProps = [...c.querySelectorAll('#offer-props input:checked')].map(i => Number(i.value));
-    const reqProps = [...c.querySelectorAll('#req-props input:checked')].map(i => Number(i.value));
-    act('proposeTrade', {
-      to,
-      offerMoney: Number($('offer-money').value) || 0,
-      reqMoney: Number($('req-money').value) || 0,
-      offerProps, reqProps,
+    c.querySelectorAll('#offer-props .trade-item').forEach(el => { if (offer.has(Number(el.dataset.pos))) el.classList.add('sel'); });
+    c.querySelectorAll('.trade-partner').forEach(el => { el.onclick = () => { target = el.dataset.id; render(); }; });
+    const bindList = (sel, set) => c.querySelectorAll(sel + ' .trade-item').forEach(el => {
+      el.onclick = () => {
+        const pos = Number(el.dataset.pos);
+        if (set.has(pos)) set.delete(pos); else set.add(pos);
+        el.classList.toggle('sel');
+        update();
+      };
     });
-    modal.classList.add('hidden');
-  };
-}
-function propCheck(side, pos) {
-  const t = BOARD[pos];
-  return `<label><input type="checkbox" value="${pos}">${propThumb(t)} ${t.name}</label>`;
+    bindList('#offer-props', offer);
+    bindList('#req-props', req);
+    $('offer-money').oninput = update;
+    $('req-money').oninput = update;
+    $('close-trade').onclick = () => modal.classList.add('hidden');
+    $('send-trade').onclick = () => {
+      act('proposeTrade', { to: target, offerMoney: om(), reqMoney: rm(), offerProps: [...offer], reqProps: [...req] });
+      modal.classList.add('hidden');
+    };
+    update();
+  }
+
+  modal.classList.remove('hidden');
+  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+  render();
 }
 
 // показать входящее предложение сделки
@@ -1337,15 +1431,29 @@ function renderTrade() {
     if (tradeShownFor === JSON.stringify(tr)) return;
     tradeShownFor = JSON.stringify(tr);
     const c = $('trade-modal-content');
-    const give = describeTrade(tr.offerProps, tr.offerMoney);
-    const get = describeTrade(tr.reqProps, tr.reqMoney);
+    c.classList.add('trade-card');
+    const from = STATE.players.find(p => p.id === tr.from);
+    const me = STATE.players.find(p => p.id === YOU);
+    const list = (props, money) => {
+      const moneyRow = money > 0 ? `<div class="pm-row trade-item ro"><span class="pm-bar" style="background:var(--accent)"></span><span class="pm-name">Деньги</span><span class="pm-price">${money}🪙</span></div>` : '';
+      const html = moneyRow + props.map(pos => tradeItemHtml(pos, false)).join('');
+      return html || '<span class="action-sub">Ничего</span>';
+    };
     c.innerHTML = `
       <div class="deed-head" style="background:#2a2f47"><div class="dh-name">🤝 Предложение от ${tr.fromName}</div></div>
-      <div class="trade-grid">
-        <div><h4>Вам предлагают</h4><div class="action-sub">${give || 'ничего'}</div></div>
-        <div><h4>Взамен просят</h4><div class="action-sub">${get || 'ничего'}</div></div>
+      <div class="trade-body">
+        <div class="trade-cols">
+          <div class="trade-col">
+            <h4>${from ? tradeAvatar(from) : ''} Вы получаете</h4>
+            <div class="trade-list">${list(tr.offerProps, tr.offerMoney)}</div>
+          </div>
+          <div class="trade-col">
+            <h4>${me ? tradeAvatar(me) : ''} Вы отдаёте</h4>
+            <div class="trade-list">${list(tr.reqProps, tr.reqMoney)}</div>
+          </div>
+        </div>
         <div class="action-row">
-          <button class="btn btn-primary" id="accept-trade">Принять</button>
+          <button class="btn btn-primary" id="accept-trade">✅ Принять</button>
           <button class="btn" id="decline-trade">Отклонить</button>
         </div>
       </div>`;

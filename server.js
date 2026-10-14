@@ -42,6 +42,7 @@ const PLAYER_COLORS = ['#e63946', '#457b9d', '#2a9d4a', '#ff8c42', '#d65db1', '#
 const START_MONEY = 1500;
 const PRAISE_COOLDOWN = 20000; // 20 секунд между похвалами
 const MORTGAGE_TURNS = 15; // через сколько ходов заложенная клетка освобождается
+const GO_LANDING_BONUS = 100; // бонус за остановку ровно на СТАРТе
 
 const rooms = {}; // code -> room
 
@@ -205,11 +206,15 @@ function broadcast(room) {
 // ---------- Игровая логика ----------
 function activePlayers(room) { return room.players.filter(p => !p.bankrupt); }
 
-// Освободить клетки, у которых истёк срок залога (15 ходов)
-function expireMortgages(room) {
+// Таймер залога идёт только в ходы владельца: в конце его хода −1, на нуле клетка освобождается
+function tickMortgages(room, ownerId) {
+  if (!ownerId) return;
   for (const pos in room.ownership) {
     const o = room.ownership[pos];
-    if (o.mortgaged && o.mortgagedTurn != null && (room.turnCount - o.mortgagedTurn) >= MORTGAGE_TURNS) {
+    if (!o.mortgaged || o.owner !== ownerId) continue;
+    if (o.mortgageLeft == null) o.mortgageLeft = MORTGAGE_TURNS; // заложено до обновления
+    o.mortgageLeft -= 1;
+    if (o.mortgageLeft <= 0) {
       const t = tile(Number(pos));
       delete room.ownership[pos]; // снова свободна
       log(room, `⏳ Срок залога «${t.name}» истёк — клетка снова свободна.`);
@@ -225,7 +230,10 @@ function nextTurn(room) {
   room.debtReturnPhase = null;
   room.builtGroups = {}; // новый ход — снова можно улучшить каждую монополию по разу
   room.turnCount = (room.turnCount || 0) + 1;
-  expireMortgages(room); // освободить клетки с истёкшим залогом
+  const ending = currentPlayer(room); // игрок, чей ход закончился
+  // таймер залога идёт только если в ходе владельца не выпадал дубль
+  if (!room.turnHadDouble) tickMortgages(room, ending && !ending.bankrupt ? ending.id : null);
+  room.turnHadDouble = false;
   if (checkWin(room)) return;
   let i = room.turnIndex;
   for (let k = 0; k < room.players.length; k++) {
@@ -256,13 +264,15 @@ function checkWin(room) {
   return false;
 }
 
-function sendToJail(room, p) {
+function sendToJail(room, p, reason) {
   p.pos = 10;
   p.inJail = true;
   p.jailTurns = 0;
   room.doublesCount = 0;
   if (room.animFor === p.id) room.animPath.push(10);
   log(room, `💀 ${p.name} погибает и отправляется на респаун.`);
+  // звук + окно смерти у всех (покажутся, когда фишка дойдёт)
+  io.to(room.code).emit('notify', { type: 'death', byId: p.id, byName: p.name, reason: reason || '' });
 }
 
 // Изменить деньги; если уходит в минус — вернёт false (нужно решать про банкротство)
@@ -302,11 +312,12 @@ function landOn(room, p, diceSum) {
     }
   } else if (t.type === 'tax') {
     if (p.pos === 4) io.to(room.code).emit('notify', { type: 'buyback' }); // звук выкупа
-    if (charge(room, p, t.amount, null, 'end')) {
-      log(room, `${p.token} ${p.name} платит ${t.name.toLowerCase()} ${t.amount}🪙.`);
-    }
+    // налог — тоже через подтверждение оплаты (можно сначала поторговаться)
+    room.pendingPay = { amount: t.amount, toId: null, toName: 'банку', toToken: '🏦', pos: t.pos, tileName: t.name };
+    room.phase = 'pay';
+    log(room, `${p.token} ${p.name} должен заплатить «${t.name}» ${t.amount}🪙.`);
   } else if (t.type === 'gotojail') {
-    sendToJail(room, p);
+    sendToJail(room, p, 'Вы попали на клетку «Вы убиты!».');
   } else if (t.type === 'chance') {
     io.to(room.code).emit('notify', { type: 'rune' }); // звук руны
     drawCard(room, p, 'chance', diceSum);
@@ -315,6 +326,11 @@ function landOn(room, p, diceSum) {
   } else {
     // go / jail(visiting) / parking
     if (t.type === 'parking') log(room, `${p.token} ${p.name} отдыхает на парковке.`);
+    if (t.type === 'go') {
+      // бонус именно за остановку на СТАРТе (сверх 200 за круг)
+      p.money += GO_LANDING_BONUS;
+      log(room, `🌀 ${p.name} остановился на Фонтане: бонус +${GO_LANDING_BONUS}🪙.`);
+    }
   }
 }
 
@@ -379,7 +395,7 @@ function applyCard(room, p, card, diceSum, deck, idx) {
       return;
     }
     case 'gotojail':
-      sendToJail(room, p);
+      sendToJail(room, p, card.text);
       break;
     case 'getout':
       p.getOutCards += 1;
@@ -470,6 +486,7 @@ function doRoll(room, p) {
   room.dice = [d1, d2];
   const sum = d1 + d2;
   const isDouble = d1 === d2;
+  if (isDouble) room.turnHadDouble = true; // в этот ход был дубль — таймер залога не тикает
 
   if (p.inJail) {
     if (isDouble) {
@@ -504,10 +521,12 @@ function doRoll(room, p) {
     room.doublesCount += 1;
     if (room.doublesCount >= 3) {
       log(room, `${p.name} выбросил третий дубль подряд — в тюрьму!`);
-      sendToJail(room, p);
+      sendToJail(room, p, 'Третий дубль подряд.');
       room.phase = 'end';
       return;
     }
+    // дубль = новый ход: снова можно улучшить каждую монополию перед следующим броском
+    room.builtGroups = {};
   }
   log(room, `🎲 ${p.name} бросает ${d1} и ${d2} = ${sum}${isDouble ? ' (дубль!)' : ''}.`);
   moveTo(room, p, (p.pos + sum) % 40, true);
@@ -776,7 +795,8 @@ function handleAction(room, sid, msg) {
       const back = canRollAgain(room, p) ? 'roll' : 'end';
       if (charge(room, p, pp.amount, pp.toId || null, back)) {
         const owner = pp.toId ? playerById(room, pp.toId) : null;
-        log(room, `${p.token} ${p.name} платит аренду ${pp.amount}🪙 игроку ${owner ? owner.name : 'банку'} за «${pp.tileName}».`);
+        if (owner) log(room, `${p.token} ${p.name} платит аренду ${pp.amount}🪙 игроку ${owner.name} за «${pp.tileName}».`);
+        else log(room, `${p.token} ${p.name} платит «${pp.tileName}» ${pp.amount}🪙.`);
         room.phase = back;
       }
       // если не хватило — charge перевёл в режим долга
@@ -888,6 +908,7 @@ function startAuction(room, pos) {
   room.auction = {
     pos,
     name: tile(pos).name,
+    minBid: tile(pos).price || 0, // стартовая ставка = цена клетки
     highBid: 0,
     highBidder: null,
     active: bidders,
@@ -895,7 +916,7 @@ function startAuction(room, pos) {
   };
   room.phase = 'auction';
   advanceAuctionTurn(room, true);
-  log(room, `🔨 Аукцион за «${tile(pos).name}». Стартовая ставка от 0🪙.`);
+  log(room, `🔨 Аукцион за «${tile(pos).name}». Стартовая ставка ${room.auction.minBid}🪙.`);
 }
 
 function advanceAuctionTurn(room, first = false) {
@@ -916,7 +937,7 @@ function auctionBid(room, p, amount) {
   if (!a || !a.active.includes(p.id)) return;
   if (room.players[a.turn].id !== p.id) return; // не его очередь
   amount = Math.floor(Number(amount) || 0);
-  if (amount <= a.highBid) return;
+  if (a.highBidder ? amount <= a.highBid : amount < (a.minBid || 0)) return; // первая ставка ≥ цены, дальше — выше текущей
   if (amount > p.money) return;
   a.highBid = amount;
   a.highBidder = p.id;
@@ -1000,9 +1021,9 @@ function mortgage(room, p, pos) {
     }
   }
   o.mortgaged = true;
-  o.mortgagedTurn = room.turnCount; // запоминаем ход для таймера залога
+  o.mortgageLeft = MORTGAGE_TURNS; // считается только в ходы владельца
   p.money += Math.floor(t.price / 2);
-  log(room, `🏦 ${p.name} закладывает «${t.name}» за ${Math.floor(t.price / 2)}🪙 (выкупить в течение ${MORTGAGE_TURNS} ходов).`);
+  log(room, `🏦 ${p.name} закладывает «${t.name}» за ${Math.floor(t.price / 2)}🪙 (выкупить в течение ${MORTGAGE_TURNS} своих ходов).`);
 }
 
 function unmortgage(room, p, pos) {
@@ -1013,6 +1034,7 @@ function unmortgage(room, p, pos) {
   if (p.money < cost) { log(room, 'Недостаточно денег для выкупа.'); return; }
   p.money -= cost;
   o.mortgaged = false;
+  delete o.mortgageLeft;
   delete o.mortgagedTurn;
   log(room, `🏦 ${p.name} выкупает «${t.name}» за ${cost}🪙.`);
 }

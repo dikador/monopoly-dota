@@ -171,8 +171,30 @@ input:focus { border-color: var(--accent2); }
   border-radius: 999px;
   box-shadow: 0 2px 6px rgba(0,0,0,.7);
 }
-.tile.mortgaged { filter: grayscale(.7) brightness(.7); }
-.tile.mortgaged::after { content: "ЗАЛОГ"; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--red); font-weight: 800; font-size: calc(var(--cell)*.13); transform: rotate(-20deg); }
+/* заложенная клетка: тускнеет картинка, а таймер остаётся ярким */
+.tile.mortgaged .body, .tile.mortgaged .strip { filter: grayscale(.7) brightness(.7); }
+.mort-timer {
+  position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  z-index: 6; pointer-events: none; white-space: nowrap; line-height: 1;
+  font-size: calc(var(--cell)*.26); font-weight: 800; color: #2a1d00;
+  padding: calc(var(--cell)*.04) calc(var(--cell)*.09);
+  background: linear-gradient(135deg, var(--accent), #ffb302);
+  border: 2px solid #fff;
+  border-radius: 999px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.85), 0 0 0 2px rgba(0,0,0,.55);
+}
+.mort-timer.low { color: #fff; background: var(--red); animation: mortPulse 1s ease-in-out infinite; }
+/* таймер залога в карточке клетки */
+.mort-box { display: flex; align-items: center; gap: 12px; margin-bottom: 12px; padding: 10px 13px; border-radius: 10px; background: rgba(255,210,63,.12); border: 1px solid rgba(255,210,63,.7); }
+.mort-box-num { flex-shrink: 0; font-family: 'Montserrat', sans-serif; font-weight: 800; font-size: 26px; color: var(--accent); }
+.mort-box-text { font-size: 13.5px; line-height: 1.5; color: #cdd3ec; }
+.mort-box-text b { color: var(--ink); }
+.mort-box.low { background: rgba(230,57,70,.15); border-color: var(--red); }
+.mort-box.low .mort-box-num { color: #ff8a93; }
+@keyframes mortPulse {
+  0%, 100% { transform: translate(-50%, -50%) scale(1); }
+  50%      { transform: translate(-50%, -50%) scale(1.12); }
+}
 
 /* фишки игроков */
 .tile .tokens { position: absolute; inset: 0; display: flex; flex-wrap: wrap; gap: 2px; justify-content: center; align-items: center; align-content: center; pointer-events: none; padding: 6%; z-index: 7; }
@@ -355,7 +377,7 @@ input:focus { border-color: var(--accent2); }
 
 /* ---------- Модальные окна ---------- */
 .modal { position: fixed; inset: 0; background: rgba(5,7,15,.7); display: flex; align-items: center; justify-content: center; z-index: 50; padding: 20px; backdrop-filter: blur(3px); }
-.modal-card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); width: 100%; max-width: 420px; overflow: hidden; }
+.modal-card { background: var(--panel); border: 1px solid var(--line); border-radius: 18px; box-shadow: var(--shadow); width: 100%; max-width: 420px; max-height: calc(100vh - 40px); overflow-x: hidden; overflow-y: auto; }
 .deed { padding: 0; }
 .deed-head { padding: 16px; color: #fff; text-align: center; }
 .deed-head .dh-icon { font-size: 40px; }
@@ -375,11 +397,27 @@ input:focus { border-color: var(--accent2); }
 .modal-actions { padding: 14px 18px; display: flex; gap: 10px; }
 .modal-close { width: 100%; }
 
-.trade-grid { padding: 18px; display: grid; gap: 12px; }
-.trade-grid h4 { margin: 0; font-size: 14px; color: var(--accent2); }
-.trade-props { display: flex; flex-direction: column; gap: 4px; max-height: 130px; overflow-y: auto; }
-.trade-props label { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 13px; color: var(--ink); cursor: pointer; }
-.trade-props input[type=checkbox] { width: auto; }
+/* окно обмена */
+.modal-card.trade-card { max-width: 640px; }
+.trade-body { padding: 18px; display: grid; gap: 12px; }
+.trade-partners { display: flex; flex-wrap: wrap; gap: 8px; }
+.trade-partner { cursor: pointer; }
+.trade-partner.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.trade-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.trade-col { background: var(--panel2); border: 1px solid var(--line); border-radius: var(--radius); padding: 12px; display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.trade-col h4 { margin: 0; font-size: 14px; color: var(--accent2); display: flex; align-items: center; gap: 6px; }
+.trade-money { display: flex; align-items: center; gap: 8px; }
+.trade-money input { flex: 1; min-width: 0; }
+.trade-money .action-sub { white-space: nowrap; }
+.trade-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
+.trade-item { cursor: pointer; }
+.trade-item.ro { cursor: default; }
+.trade-item.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.trade-summary { font-size: 13px; color: var(--muted); line-height: 1.6; }
+.trade-summary b { color: var(--ink); }
+.trade-summary .pi-img { width: 18px; height: 18px; }
+.trade-warn { color: var(--red); font-size: 12px; margin-top: 4px; }
+@media (max-width: 700px) { .trade-cols { grid-template-columns: 1fr; } }
 
 @media (max-width: 980px) {
   #game-screen { grid-template-columns: 1fr; height: auto; }
