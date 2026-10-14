@@ -41,6 +41,7 @@ const TOKEN_HEROES = [
 const PLAYER_COLORS = ['#e63946', '#457b9d', '#2a9d4a', '#ff8c42', '#d65db1', '#ffd23f', '#6a4c93', '#1d3557'];
 const START_MONEY = 1500;
 const PRAISE_COOLDOWN = 20000; // 20 секунд между похвалами
+const MORTGAGE_TURNS = 15; // через сколько ходов заложенная клетка освобождается
 
 const rooms = {}; // code -> room
 
@@ -78,6 +79,7 @@ function newRoom(code) {
     builtGroups: {},  // какие монополии уже улучшали в этом ходу
     pendingDebt: null,    // долг, который игрок должен погасить (продав имущество) или обанкротиться
     debtReturnPhase: null,// фаза, в которую вернуться после погашения долга
+    turnCount: 0,         // счётчик ходов (для таймера залога)
     ownership: {}, // pos -> { owner, houses(0-5), mortgaged }
     chanceDeck: shuffle(CHANCE.map((_, i) => i)),
     chestDeck: shuffle(CHEST.map((_, i) => i)),
@@ -165,6 +167,8 @@ function publicState(room) {
     animPath: room.animPath,
     builtGroups: room.builtGroups,
     pendingDebt: room.pendingDebt,
+    turnCount: room.turnCount,
+    mortgageTurns: MORTGAGE_TURNS,
     ownership: room.ownership,
     auction: room.auction,
     trade: room.trade,
@@ -201,6 +205,18 @@ function broadcast(room) {
 // ---------- Игровая логика ----------
 function activePlayers(room) { return room.players.filter(p => !p.bankrupt); }
 
+// Освободить клетки, у которых истёк срок залога (15 ходов)
+function expireMortgages(room) {
+  for (const pos in room.ownership) {
+    const o = room.ownership[pos];
+    if (o.mortgaged && o.mortgagedTurn != null && (room.turnCount - o.mortgagedTurn) >= MORTGAGE_TURNS) {
+      const t = tile(Number(pos));
+      delete room.ownership[pos]; // снова свободна
+      log(room, `⏳ Срок залога «${t.name}» истёк — клетка снова свободна.`);
+    }
+  }
+}
+
 function nextTurn(room) {
   room.doublesCount = 0;
   room.pendingPos = null;
@@ -208,6 +224,8 @@ function nextTurn(room) {
   room.pendingDebt = null;
   room.debtReturnPhase = null;
   room.builtGroups = {}; // новый ход — снова можно улучшить каждую монополию по разу
+  room.turnCount = (room.turnCount || 0) + 1;
+  expireMortgages(room); // освободить клетки с истёкшим залогом
   if (checkWin(room)) return;
   let i = room.turnIndex;
   for (let k = 0; k < room.players.length; k++) {
@@ -338,6 +356,7 @@ function drawCard(room, p, kind, diceSum) {
   const idx = deck.shift();
   const card = list[idx];
   log(room, `${kind === 'chance' ? '🔮 Руна' : '📦 Курьер'}: ${card.text}`);
+  io.to(room.code).emit('notify', { type: 'card', kind, text: card.text, byId: p.id, byName: p.name });
   applyCard(room, p, card, diceSum, deck, idx);
 }
 
@@ -430,33 +449,16 @@ function charge(room, p, amount, creditorId, returnPhase) {
   return false;
 }
 
-// Банкротство: активы — кредитору (или в банк). Без авто-распродажи «на выживание».
+// Банкротство: все активы освобождаются (в банк). Ничего не переходит другому игроку.
 function declareBankrupt(room, debtor, creditorId) {
-  const creditor = creditorId ? playerById(room, creditorId) : null;
-  // дома продаются банку, деньги идут в общий расчёт
+  // все клетки игрока снова свободны (дома/залог сбрасываются)
   for (const pos in room.ownership) {
-    const o = room.ownership[pos];
-    if (o.owner === debtor.id && o.houses > 0) {
-      debtor.money += o.houses * Math.floor(tile(Number(pos)).house / 2);
-      o.houses = 0;
-    }
-  }
-  if (creditor) {
-    creditor.money += debtor.money;
-    for (const pos in room.ownership) {
-      if (room.ownership[pos].owner === debtor.id) room.ownership[pos].owner = creditor.id;
-    }
-    creditor.getOutCards += debtor.getOutCards;
-    log(room, `💥 ${debtor.name} банкрот! Активы переходят к ${creditor.name}.`);
-  } else {
-    for (const pos in room.ownership) {
-      if (room.ownership[pos].owner === debtor.id) delete room.ownership[pos];
-    }
-    log(room, `💥 ${debtor.name} банкрот! Активы возвращаются в банк.`);
+    if (room.ownership[pos].owner === debtor.id) delete room.ownership[pos];
   }
   debtor.money = 0;
   debtor.getOutCards = 0;
   debtor.bankrupt = true;
+  log(room, `💥 ${debtor.name} банкрот! Его клетки снова свободны.`);
 }
 
 // ---------- Действия игроков ----------
@@ -998,8 +1000,9 @@ function mortgage(room, p, pos) {
     }
   }
   o.mortgaged = true;
+  o.mortgagedTurn = room.turnCount; // запоминаем ход для таймера залога
   p.money += Math.floor(t.price / 2);
-  log(room, `🏦 ${p.name} закладывает «${t.name}» за ${Math.floor(t.price / 2)}🪙.`);
+  log(room, `🏦 ${p.name} закладывает «${t.name}» за ${Math.floor(t.price / 2)}🪙 (выкупить в течение ${MORTGAGE_TURNS} ходов).`);
 }
 
 function unmortgage(room, p, pos) {
@@ -1010,6 +1013,7 @@ function unmortgage(room, p, pos) {
   if (p.money < cost) { log(room, 'Недостаточно денег для выкупа.'); return; }
   p.money -= cost;
   o.mortgaged = false;
+  delete o.mortgagedTurn;
   log(room, `🏦 ${p.name} выкупает «${t.name}» за ${cost}🪙.`);
 }
 

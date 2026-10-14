@@ -179,8 +179,40 @@ socket.on('notify', (n) => {
     pendingSounds.push(() => playClip('buyback')); // прозвучит, когда фишка дойдёт
   } else if (n.type === 'rune') {
     pendingSounds.push(() => playClip('rune'));
+  } else if (n.type === 'card') {
+    // попап с текстом карты — когда фишка дойдёт до клетки
+    pendingSounds.push(() => {
+      if (STATE && STATE.animFor === YOU) showCardModal(n.kind, n.text);
+      else showToast({
+        icon: n.kind === 'chance' ? '🔮' : '📦',
+        title: `${n.byName}: ${n.kind === 'chance' ? 'Руна' : 'Курьер'}`,
+        text: n.text,
+        highlight: false,
+      });
+    });
   }
 });
+
+let cardModalTimer = null;
+function showCardModal(kind, text) {
+  const modal = $('card-modal');
+  const c = $('card-modal-content');
+  if (!modal || !c) return;
+  const isRune = kind === 'chance';
+  c.innerHTML = `
+    <div class="deed-head" style="background:${isRune ? '#2a3f5c' : '#5c3f2a'}">
+      <div class="dh-icon">${isRune ? '🔮' : '📦'}</div>
+      <div class="dh-name">${isRune ? 'Руна' : 'Курьер'}</div>
+    </div>
+    <div class="deed-body"><div class="deed-desc" style="font-size:16px; line-height:1.5">${text}</div></div>
+    <div class="modal-actions"><button class="btn btn-primary card-close" style="width:100%">Ок</button></div>`;
+  modal.classList.remove('hidden');
+  const close = () => modal.classList.add('hidden');
+  c.querySelector('.card-close').onclick = close;
+  modal.onclick = (e) => { if (e.target === modal) close(); };
+  clearTimeout(cardModalTimer);
+  cardModalTimer = setTimeout(close, 6000);
+}
 
 // Воспроизведение mp3-клипов событий с учётом громкости звуков
 const clipCache = {};
@@ -484,7 +516,7 @@ function renderBoard() {
     else if (t.type === 'tax') stripBg = '#3a2536';
     let priceText = '';
     if (t.type === 'tax') priceText = `−${t.amount}🪙`;
-    else if (o && o.mortgaged) priceText = 'залог';
+    else if (o && o.mortgaged) priceText = `залог ${mortgageLeft(o)}х`;
     else if (o) priceText = clientRentDisplay(t, o);
     else if (t.price) priceText = `${t.price}🪙`;
 
@@ -933,7 +965,7 @@ function renderPropertyManager(panel, me, isMyTurn) {
     const barColor = t.group ? GROUPS[t.group].color : '#888';
     let label = t.name;
     if (t.type === 'street' && o.houses > 0) label += o.houses === 5 ? ' 🌟' : ' ' + '⭐'.repeat(o.houses);
-    if (o.mortgaged) label += ' (залог)';
+    if (o.mortgaged) label += ` (залог, ${mortgageLeft(o)}х)`;
     item.innerHTML = `<div class="pi-bar" style="background:${barColor}"></div>${propThumb(t)}<div class="pi-name">${label}</div>`;
 
     // кнопки
@@ -958,6 +990,13 @@ function renderPropertyManager(panel, me, isMyTurn) {
     wrap.appendChild(item);
   });
   panel.appendChild(wrap);
+}
+
+// Остаток ходов до освобождения заложенной клетки
+function mortgageLeft(o) {
+  const lim = STATE.mortgageTurns || 15;
+  const left = lim - ((STATE.turnCount || 0) - (o.mortgagedTurn || 0));
+  return Math.max(0, left);
 }
 
 function ownsFullGroupClient(group) {
@@ -1066,6 +1105,30 @@ function openTileModal(pos) {
 
   let desc = tileDescription(t);
   if (t.img && desc) desc = desc.replace(/^\s*[^\s<]+\s+/, ''); // убрать ведущий эмодзи, если есть фото
+
+  // действия с клеткой, если она ваша
+  const me = STATE.players.find(p => p.id === YOU);
+  let actionsHtml = '';
+  let hint = '';
+  if (o && me && !me.bankrupt && o.owner === YOU) {
+    const myBuildTurn = STATE.currentPlayerId === YOU && (STATE.phase === 'roll' || STATE.phase === 'end');
+    if (t.type === 'street' && !o.mortgaged) {
+      const full = ownsFullGroupClient(t.group);
+      const built = STATE.builtGroups && STATE.builtGroups[t.group];
+      if (full && o.houses < 5) {
+        if (built) hint = 'Эту монополию уже улучшали в этом ходу.';
+        else if (!myBuildTurn) hint = 'Строить можно в свой ход — до броска кубиков.';
+        else if (me.money < t.house) hint = 'Недостаточно денег на постройку.';
+        else actionsHtml += `<button class="btn btn-primary tile-act" data-act="build" style="width:100%">🏠 Построить за ${t.house}🪙</button>`;
+      } else if (!full) {
+        hint = 'Чтобы строить, нужна вся группа (монополия).';
+      }
+      if (o.houses > 0) actionsHtml += `<button class="btn tile-act" data-act="sellHouse">🏠− Продать (${Math.floor(t.house / 2)}🪙)</button>`;
+    }
+    if (!o.mortgaged && (t.type !== 'street' || o.houses === 0)) actionsHtml += `<button class="btn tile-act" data-act="mortgage">🏦 Заложить (${Math.floor(t.price / 2)}🪙)</button>`;
+    if (o.mortgaged) actionsHtml += `<button class="btn tile-act" data-act="unmortgage">🏦 Выкупить (${Math.ceil(t.price / 2 * 1.1)}🪙)</button>`;
+  }
+
   c.innerHTML = `
     <div class="deed">
       <div class="deed-head" style="background:${headColor}">
@@ -1076,12 +1139,20 @@ function openTileModal(pos) {
       <div class="deed-body">
         ${desc ? `<div class="deed-desc">${desc}</div>` : ''}
         ${rows}
+        ${hint ? `<div class="action-sub" style="margin-top:8px">${hint}</div>` : ''}
       </div>
-      <div class="modal-actions"><button class="btn modal-close">Закрыть</button></div>
+      <div class="modal-actions" style="flex-wrap:wrap; gap:8px">
+        ${actionsHtml}
+        <button class="btn modal-close" style="width:100%">Закрыть</button>
+      </div>
     </div>`;
   modal.classList.remove('hidden');
-  c.querySelector('.modal-close').onclick = () => modal.classList.add('hidden');
-  modal.onclick = (e) => { if (e.target === modal) modal.classList.add('hidden'); };
+  const close = () => modal.classList.add('hidden');
+  c.querySelector('.modal-close').onclick = close;
+  c.querySelectorAll('.tile-act').forEach(b => {
+    b.onclick = () => { act(b.dataset.act, { pos }); close(); };
+  });
+  modal.onclick = (e) => { if (e.target === modal) close(); };
 }
 function deedRow(l, v) { return `<div class="deed-row"><span class="dl">${l}</span><span class="dv">${v}</span></div>`; }
 
@@ -1105,7 +1176,7 @@ function openPlayerModal(pid) {
       if (t.type === 'street' && o.houses > 0) stars = o.houses === 5 ? ' 🌟' : ' ' + '⭐'.repeat(o.houses);
       const bar = t.group ? GROUPS[t.group].color : '#7a849c';
       const price = o.mortgaged
-        ? '<span style="color:var(--red)">залог</span>'
+        ? `<span style="color:var(--red)">залог · ${mortgageLeft(o)}х</span>`
         : `${t.price}🪙 · аренда ${clientRentDisplay(t, o)}`;
       return `<div class="pm-row"><span class="pm-bar" style="background:${bar}"></span>${propThumb(t)}<span class="pm-name">${t.name}${stars}</span><span class="pm-price">${price}</span></div>`;
     }).join('');
